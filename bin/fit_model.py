@@ -1,5 +1,6 @@
-from nonnnegative_projection_model import *
-from warnings import warn
+import warnings, argparse
+
+from nonnegative_projection_model import *
 
 ##################
 ## argument parser
@@ -11,20 +12,15 @@ parser = argparse.ArgumentParser(description='Fit non-negative projection model.
 ## file handling
 parser.add_argument('--data', 
                     type=str, 
-                    default='./frame_counts.csv')
+                    default='../bin/frame_counts.csv')
 parser.add_argument('--output', 
                     type=str, 
-                    default='./model_fits/full_gibbs')
+                    default='../bin/model_fits/full_gibbs')
 
-## model hyperparameters
-parser.add_argument('--nonparametric', 
-                    nargs='?', 
-                    const=True, 
-                    default=False)
-parser.add_argument('--featurenum', 
+## model form
+parser.add_argument('--featurenum', ## if set to 0, nonparametric prior used 
                     type=int, 
-                    default=10)
-
+                    default=0)
 parser.add_argument('--featureform',
                     type=str, 
                     choices=['discrete', 'continuous'], 
@@ -34,12 +30,20 @@ parser.add_argument('--loadingprior',
                     choices=['exponential', 'laplace'], 
                     default='exponential')
 
-parser.add_argument('--featuresparsity', 
+## model hyperparameters
+parser.add_argument('--alpha', ## feature success
                     type=float, 
                     default=1.)
-parser.add_argument('--loadingsparsity', 
+parser.add_argument('--beta', ## feature failure; won't be used if nonparametric
                     type=float, 
                     default=1.)
+parser.add_argument('--lambda', ## feature loading sparsity 
+                    type=float, 
+                    default=1.)
+parser.add_argument('--gamma', ## feature loading sparsity 
+                    type=float, 
+                    default=1.)
+
 
 ## parameter initialization
 parser.add_argument('--loadobjfeatures', 
@@ -55,6 +59,10 @@ parser.add_argument('--loaddistributions',
                     const=True,
                     default=False)
 
+parser.add_argument('--optimizeobjfeatures', 
+                    type=str, 
+                    choices=['', 'L-BFGS-B', 'TNC', 'COBYLA', 'SLSQP'], 
+                    default='')
 parser.add_argument('--optimizefeatloadings', 
                     type=str, 
                     choices=['', 'L-BFGS-B', 'TNC', 'COBYLA', 'SLSQP'], 
@@ -74,6 +82,13 @@ parser.add_argument('--burnin',
 parser.add_argument('--thinning', 
                     type=int, 
                     default=100)
+
+parser.add_argument('--distributionproposalbandwidth', 
+                    type=float, 
+                    default=1.)
+parser.add_argument('--featloadingsproposalbandwidth', 
+                    type=float, 
+                    default=1.)
 
 parser.add_argument('--samplefeatloadings', 
                     nargs='?',
@@ -96,7 +111,7 @@ try:
     assert args.loadfeatloadings != args.optimizefeatloadings
     assert args.loaddistributions != args.optimizedistributions
 except AssertionError:
-    warn('''if parameters are loaded, they will not be pre-optimized\ 
+    warnings.warn('''if parameters are loaded, they will not be pre-optimized\ 
             using MLE, though they will be optimized instead of sampled\ 
             during model fit''')
 
@@ -112,3 +127,24 @@ except AssertionError:
 ##########
 ## fitting
 ##########
+
+data_likelihood = PoissonGammaProductLikelihood(data_fname=args.data, 
+                                                gamma=args.gamma)
+
+D_sampler = DSampler(likelihood=data_likelihood, 
+                     proposal_bandwidth=args.distributionproposalbandwidth, 
+                     optimizer=args.optimizedistributions)
+
+beta_posterior = BetaPosterior(D_inference=D_sampler)
+
+Z_sampler = ZSampler(likelihood=beta_posterior,
+                     alpha=args.alpha,
+                     num_of_latfeats=args.featurenum)
+
+# B_sampler = BSampler(likelihood=beta_posterior,
+#                      lam=args.alpha,
+#                      num_of_latfeats=Z_sampler.get_num_of_latfeats())
+
+
+# model = FullGibbs(D_sampler, Z_sampler, B_sampler)
+# model.fit(args.iterations, args.burnin, args.thinning)
