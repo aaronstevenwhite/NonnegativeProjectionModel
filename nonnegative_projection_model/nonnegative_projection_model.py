@@ -380,8 +380,7 @@ class ZSampler(Sampler):
                                              size=[self._num_of_objects, 
                                                    self._num_of_latfeats])
 
-        self._set_feature_counts()
-        self._set_log_counts_minus_obj()
+        self._update_feature_counts()
 
     def _thresholded_nmf(self, D):
         nmf_model = ProjectedGradientNMF(n_components=self._num_of_latfeats, 
@@ -401,35 +400,30 @@ class ZSampler(Sampler):
         self._append_to_other_matrices = likelihood.append_to_other_matrices
 
 
-    def _set_feature_counts(self):
-        self._feature_counts = self._Z.sum(axis=0)
+    def _update_feature_counts(self, z_new=None, obj=None, latfeat=None):
+        if z_new == None:
+            self._feature_counts = self._Z.sum(axis=0)
+            self._update_log_counts_minus_obj()
 
-    def _update_feature_counts(self, new, obj, feat):
-        if new != self._Z[obj, latfeat]:
-            self._feature_counts[obj, feat] += self._Z[obj, feat] - new
+        elif z_new != self._Z[obj, latfeat]:
+            self._feature_counts[obj, latfeat] += self._Z[obj, latfeat] - z_new
+            self._update_log_counts_minus_obj(obj)
 
-    def _set_log_counts_minus_obj(self):
-        self._log_counts_minus_obj = np.log(self._feature_counts[None,:] - self._Z)
+    def _update_log_counts_minus_obj(self, obj=None):
+        if obj == None:
+            self._log_counts_minus_obj = np.log(self._feature_counts[None,:] - self._Z)
+
+        else:
+            self._log_counts_minus_obj[obj] = np.log(self._feature_counts - self._Z[obj])
 
 
-    def _update_log_counts_minus_obj(self, obj):
-        self._log_counts_minus_obj[obj] = np.log(self._feature_counts - self._Z[obj])
-
-
-    def _compute_log_posterior(self, val, obj, latfeat):
-        log_likelihood = self._log_likelihood(val=val, obj=obj, latfeat=feat)
+    def _compute_log_posterior(self, z_new, obj, latfeat):
+        log_likelihood = self._log_likelihood(z_new=z_new, obj=obj, latfeat=feat)
 
         return self._log_counts_minus_obj[obj, latfeat] + log_likelihood
 
-    def _sample_val(self, obj, latfeat):
-        logpost_on = self._compute_log_posterior(1, obj, latfeat)
-        logpost_off = self._compute_log_posterior(0, obj, latfeat)
 
-        prob = logpost_on / np.logaddexp(logpost_on, logpost_off)
-
-        return sp.stats.bernoulli.rvs(prob)
-
-    def _compress_Z(self):
+    def _compress(self):
         latfeats_gt_0 = self.feature_counts > 0
 
         self._Z = self._Z.compress(latfeats_gt_0, axis=1)
@@ -437,43 +431,43 @@ class ZSampler(Sampler):
 
         self._compress_other_matrices(latfeats_gt_0)
 
-    def _append_new_latent_features(self, obj):
-        num_of_new_latent_features = sp.stats.poisson.rvs(mu=self._poisson_param)
+    def _append_new_latfeats(self, obj):
+        num_of_new_latfeats = sp.stats.poisson.rvs(mu=self._poisson_param)
 
-        if num_of_new_latent_features:
-            new_latent_features = np.zeros([num_of_objects, num_of_new_latent_features])
-            new_latent_features[obj] += 1
+        if num_of_new_latfeats:
+            new_latfeats = np.zeros([num_of_objects, num_of_new_latfeats])
+            new_latfeats[obj] += 1
 
-            self._Z = np.append(self._Z, new_latent_features, axis=1)
+            self._Z = np.append(self._Z, new_latfeats, axis=1)
             self.feature_counts = np.append(self.feature_counts, 
-                                            np.ones(num_of_new_latent_features))
+                                            np.ones(num_of_new_latfeats))
 
-            self._append_to_other_matrices(num_of_new_latent_features)
-
-    def _reorder_Z(self):
-        raise NotImplementedError
-        self._reorder_other_matrices(reordered_indices)
-
-    def _update_Z_obj(self, obj):
-        self._update_log_counts_minus_obj(obj)
-
-        for latfeat in np.arange(self.num_of_latent_features):
-            new = self._sample_val(obj, latfeat)
-            self._update_feature_counts(new, obj, latfeat)
-            self._Z[obj, latfeat] = new
-
-            self._compress_Z()
-            self._append_new_latent_features(obj)
-            #self._reorder_Z()
-
-
-    def _update_Z(self):
-
-        for obj in np.arange(self.num_of_objects):
-            self._update_Z_obj(obj)
+            self._latfeat_range = range(self._Z.shape[1])
+            self._append_to_other_matrices(num_of_new_latfeats)
 
     def get_num_of_latfeats(self):
         return self._Z.shape[1]
+
+    def _sample(self, obj, latfeat):
+        logpost_on = self._compute_log_posterior(1, obj, latfeat)
+        logpost_off = self._compute_log_posterior(0, obj, latfeat)
+
+        prob = logpost_on / np.logaddexp(logpost_on, logpost_off)
+
+        return sp.stats.bernoulli.rvs(prob)
+
+    def sample(self):
+        for obj in self._obj_range:
+            self._update_log_counts_minus_obj(obj)
+
+            for latfeat in self._latfeat_range:
+                new = self._sample(obj, latfeat)
+                self._update_feature_counts(new, obj, latfeat)
+                self._Z[obj, latfeat] = new
+
+            self._compress()
+            self._append_new_latfeats(obj)
+
 
 class BSampler(Sampler):
 
@@ -598,32 +592,3 @@ class FullGibbs(Model):
 
             if itr >= burnin and not itr % thinning:
                 self._save_samples(iterations, burnin, thinning)
-
-
-class BSampler(Sampler):
-
-    def __init_(self, likelihood, lam, num_of_latfeats):
-        ## initialize ranges so they don't have to 
-        ## be recomputed each time a range is needed
-        self._latfeat_range = range(self._D.shape[0])
-        self._obsfeat_range = range(self._D.shape[1])
-
-        raise NotImplementedError
-
-    def _initialize_likelihood(self, likelihood):
-        likelihood.link_prior_params(B_inference=self)
-        
-        self._log_likelihood = likelihood.compute_log_likelihood_B
-
-    def compress(self, latfeat_gt_0):
-        self._B = self._B[latfeat_gt_0]
-
-    def sample_new_features(self, num_of_new_features):
-        raise NotImplementedError
-
-    def sample(self):
-        self._update_log_posterior_values()
-
-        for obj in self._latfeat_range:
-            for obsfeat in self._obsfeat_range:
-                self._sample(obj, obsfeat)
