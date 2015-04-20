@@ -128,7 +128,9 @@ except AssertionError:
 ## fitting
 ##########
 
-data_likelihood = PoissonGammaProductLikelihood(data_fname=args.data, 
+data = BatchData(data_fname=args.data)
+
+data_likelihood = PoissonGammaProductLikelihood(data=data,
                                                 gamma=args.gamma)
 
 D_sampler = DSampler(likelihood=data_likelihood, 

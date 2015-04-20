@@ -6,6 +6,98 @@ import theano
 from scipy.optimize import minimize
 from sklearn.decomposition import ProjectedGradientNMF
 
+##########
+## data ##
+##########
+
+class Data(object):
+
+    def _load_X(self, fname):
+        data = np.loadtxt(fname, 
+                          dtype=str, 
+                          delimiter=',')
+
+        self.objects = data[1:,0]
+        self.features = data[0,1:]
+        self._X = data[1:,1:].astype(int)
+
+    def _initialize_ranges(self):
+        self._obj_range = range(self._X.shape[0])
+        self._obsfeat_range = range(self._X.shape[1])
+
+    def get_data(self):
+        return self._X
+
+    def get_obj_range(self):
+        return self._obj_range
+
+    def get_obsfeat_range(self):
+        return self._obsfeat_range
+
+
+class BatchData(Data):
+
+    def __init__(self, data_fname):
+        self._load_X(data_fname)
+
+        self._initialize_obj_counts()
+        self._initialize_ranges()
+
+    def _initialize_obj_counts(self):
+        self._X_obj_count = self._X.sum(axis=1)
+
+    def get_obj_counts(self):
+        return self._X_obj_count
+
+class IncrementalData(Data):
+
+    def __init__(self, data_fname, seed=0):
+        np.random.seed(seed)
+
+        self._load_X(data_fname)
+
+        self._initialize_obj_counts()
+        self._initialize_ranges()
+
+        self._seen = np.zeros(self._X.shape)
+        self._initialize_pair_probs()
+
+    def __iter__(self):
+        return self
+
+    def _initialize_obj_counts(self):
+        self._X_obj_count = np.zeros(self._X.shape[0])
+        self._unseen = self._X.astype(float)
+
+    def _update_pair_probs(self):
+        self._pair_probs = (self._unseen / self._unseen.sum()).flatten()
+
+    def _sample_pair(self):
+        pair_index = np.random.choice(a=self._pairs_probs.shape[0], 
+                                      p=self._pair_probs)
+
+        obj_index = pair_index / self._X.shape[1]
+        obsfeat_index = pair_index / self._X.shape[0]
+        
+        self._unseen[obj_index, obsfeat_index] -= 1
+        self._seen[obj_index, obsfeat_index] += 1
+
+        self._update_pair_probs()
+
+        return obj_index, obsfeat_index
+
+    def next(self):
+        try:
+            assert self._unseen.sum() > 0
+        except AssertionError:
+            raise StopIteration
+
+        datum = np.zeros(self._X.shape)
+        datum[self._sample_pair()] += 1
+
+        return datum
+
+
 ##############
 ## likelihoods
 ##############
@@ -28,34 +120,17 @@ class Prior(object):
 
 class PoissonGammaProductLikelihood(Likelihood):
 
-    def __init__(self, data_fname, gamma=1.):
-        ## gamma distribution parameters
+    def __init__(self, data, gamma=1.):
         self.gamma = gamma
 
-        self._load_X(data_fname)
-
-    def _load_X(self, fname):
-        data = np.loadtxt(fname, 
-                          dtype=str, 
-                          delimiter=',')
-
-        self.objects = data[1:,0]
-        self.features = data[0,1:]
-        self._X = data[1:,1:].astype(int)
-
-        self._X_obj_count = self._X.sum(axis=1)
-
-        self._obj_range = range(self._X.shape[0])
-        self._obsfeat_range = range(self._X.shape[1])
+        self._data = data
+        self._X = data.get_data()
+        self._X_obj_count = data.get_obj_counts()
+        self._obj_range = data.get_obj_range()
+        self._obsfeat_range = data.get_obsfeat_range()
 
     def get_data(self):
-        return self._X
-
-    # def get_X_count(self, obj, obsfeat=None):
-    #     if obsfeat == None:
-    #         return self._X_obj_count[obj]
-    #     else:
-    #         return self._X[obj, obsfeat]
+        return self._data.get_data()
 
     def compute_log_likelihood(self, D, obj=None, obsfeat=None):
         obj = self._obj_range if obj == None else obj
@@ -111,6 +186,14 @@ class BetaPosterior(Prior, Likelihood):
 
     def get_data(self):
         return self._D
+
+    def get_param(self, param):
+        if param == 'Z':
+            return self._Z
+
+        elif param == 'B':
+            return self._B
+
 
     def _compute_ll_z_new(self, z_new, obj, latfeat):
         z_obj = np.insert(np.delete(self._Z[obj,:], 
@@ -344,7 +427,7 @@ class ZSampler(Sampler):
       alpha
     """
     
-    def __init__(self, likelihood, alpha, beta=None, num_of_latfeats=0, optimize=True):
+    def __init__(self, likelihood, alpha, beta=1., num_of_latfeats=0, optimize=True):
         """
         Initialize the verb-by-latent binary feature sampler
 
@@ -471,18 +554,33 @@ class ZSampler(Sampler):
 
 class BSampler(Sampler):
 
-    def __init_(self, likelihood, lam, num_of_latfeats):
-        ## initialize ranges so they don't have to 
-        ## be recomputed each time a range is needed
-        self._latfeat_range = range(num_of_latfeats)
-        self._obsfeat_range = range(self._D.shape[1])
+    def __init_(self, likelihood, lam, num_of_latfeats, optimize=True):
+        self.lambda = lam
 
-        raise NotImplementedError
+        self._num_of_latfeats = num_of_latfeats
+        self._num_of_obsfeats = likelihood.get_data().shape[1]
+
+        self._initialize_B(likelihood, num_of_latfeats, optimize)    
+        self._initialize_likelihood(likelihood)
 
     def _initialize_likelihood(self, likelihood):
         likelihood.link_prior_params(B_inference=self)
         
         self._log_likelihood = likelihood.compute_log_likelihood
+
+    def _initialize_Z(self, likelihood, num_of_latfeats, optimize):
+        D = likelihood.get_data()
+
+        if optimize:
+            self._B = self._MAP_optimize(D)
+        else:
+            Z = likelihood.get_param('Z')
+            self._B = np.dot(Z.T, D)
+
+        self._update_feature_counts()
+
+    def _MAP_optimize(self, D):
+        raise NotImplementedError
 
     def compress(self, latfeat_gt_0):
         self._B = self._B[latfeat_gt_0]
