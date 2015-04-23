@@ -1,6 +1,7 @@
 import warnings, argparse
 
 from nonnegative_projection_model import *
+from nmf import initialize_D_Z_B
 
 ##################
 ## argument parser
@@ -18,7 +19,10 @@ parser.add_argument('--output',
                     default='../bin/model_fits/full_gibbs')
 
 ## model form
-parser.add_argument('--featurenum', ## if set to 0, nonparametric prior used 
+parser.add_argument('--nonparametric',
+                    type=bool, 
+                    default=False)
+parser.add_argument('--featurenum',
                     type=int, 
                     default=0)
 parser.add_argument('--featureform',
@@ -37,20 +41,19 @@ parser.add_argument('--alpha', ## feature success
 parser.add_argument('--beta', ## feature failure; won't be used if nonparametric
                     type=float, 
                     default=1.)
-parser.add_argument('--lambda', ## feature loading sparsity 
+parser.add_argument('--lmbda', ## feature loading sparsity 
                     type=float, 
                     default=1.)
 parser.add_argument('--gamma', ## feature loading sparsity 
                     type=float, 
                     default=1.)
 
-
 ## parameter initialization
-parser.add_argument('--loadobjfeatures', 
+parser.add_argument('--loadobjectfeatures', 
                     nargs='?',
                     const=True,
                     default=False)
-parser.add_argument('--loadfeatloadings', 
+parser.add_argument('--loadfeatureloadings', 
                     nargs='?',
                     const=True,
                     default=False)
@@ -59,18 +62,16 @@ parser.add_argument('--loaddistributions',
                     const=True,
                     default=False)
 
-parser.add_argument('--optimizeobjfeatures', 
-                    type=str, 
-                    choices=['', 'L-BFGS-B', 'TNC', 'COBYLA', 'SLSQP'], 
-                    default='')
-parser.add_argument('--optimizefeatloadings', 
-                    type=str, 
-                    choices=['', 'L-BFGS-B', 'TNC', 'COBYLA', 'SLSQP'], 
-                    default='')
+## optimization parameters
+parser.add_argument('--optimizeobjectfeatures', 
+                    type=bool, 
+                    default=False)
+parser.add_argument('--optimizefeatureloadings', 
+                    type=bool, 
+                    default=False)
 parser.add_argument('--optimizedistributions', 
-                    type=str, 
-                    choices=['', 'L-BFGS-B', 'TNC', 'COBYLA', 'SLSQP'], 
-                    default='')
+                    type=bool, 
+                    default=False)
 
 ## sampler parameters
 parser.add_argument('--iterations', 
@@ -83,21 +84,13 @@ parser.add_argument('--thinning',
                     type=int, 
                     default=100)
 
+## metropolis-hastings proposer parameters
 parser.add_argument('--distributionproposalbandwidth', 
                     type=float, 
                     default=1.)
 parser.add_argument('--featloadingsproposalbandwidth', 
                     type=float, 
                     default=1.)
-
-parser.add_argument('--samplefeatloadings', 
-                    nargs='?',
-                    const=False,
-                    default=True)
-parser.add_argument('--sampledistributions', 
-                    nargs='?',
-                    const=False,
-                    default=True)
 
 ## parse arguments
 args = parser.parse_args()
@@ -107,46 +100,67 @@ args = parser.parse_args()
 ##################
 
 try:
-    assert args.loadobjfeatures != args.optimizeobjfeatures
-    assert args.loadfeatloadings != args.optimizefeatloadings
-    assert args.loaddistributions != args.optimizedistributions
+    assert args.nonparametric ^ args.featurenum
 except AssertionError:
-    warnings.warn('''if parameters are loaded, they will not be pre-optimized\ 
-            using MLE, though they will be optimized instead of sampled\ 
-            during model fit''')
+    warnings.warn('''both nonparametric and featurenum were set;\
+                     featurenum will only be used for initialization;\
+                     the number of latent features will be sampled''')    
 
 try:
-    assert args.samplefeatloadings or args.optimizefeatloadings
-    assert args.sampledistributions or args.optimizedistributions
+    assert args.nonparametric != (args.beta == 1.)
 except AssertionError:
-    raise ValueError, '''if parameters are not sampled, they must be optimized;\ 
-                         please choose a constrained optimizer (e.g. L-BFGS-B)\
-                         from those made available in scipy.optimize'''
+    warnings.warn('''sampler has been set to nonparametric and\ 
+                     beta has been set to a value different from 1;\
+                     beta will be ignored (Pitman-Yor is not implemented)''')
 
+try:
+    assert args.loadobjectfeatures != args.optimizeobjectfeatures
+    assert args.loadfeatureloadings != args.optimizefeatureloadings
+    assert args.loaddistributions != args.optimizedistributions
+except AssertionError:
+    warnings.warn('''parameters will be loaded but not pre-optimized;\
+                     they will be optimized instead of sampled\ 
+                     during model fit''')
 
 ##########
 ## fitting
 ##########
 
+print 'loading data'
+
 data = BatchData(data_fname=args.data)
+
+num_of_latfeats = args.featurenum if args.featurenum else 100
+
+initial_D, initial_Z, initial_B = initialize_D_Z_B(data.get_data(),
+                                                   num_of_latfeats,
+                                                   maxiter=100,
+                                                   subiter=100)
 
 data_likelihood = PoissonGammaProductLikelihood(data=data,
                                                 gamma=args.gamma)
 
-D_sampler = DSampler(likelihood=data_likelihood, 
-                     proposal_bandwidth=args.distributionproposalbandwidth, 
-                     optimizer=args.optimizedistributions)
+print 'initializing D sampler'
+
+D_sampler = DSampler(D=initial_D,
+                     likelihood=data_likelihood, 
+                     proposal_bandwidth=args.distributionproposalbandwidth)
 
 beta_posterior = BetaPosterior(D_inference=D_sampler)
 
-Z_sampler = ZSampler(likelihood=beta_posterior,
+print 'initializing Z sampler'
+
+Z_sampler = ZSampler(Z=initial_Z,
+                     likelihood=beta_posterior,
                      alpha=args.alpha,
-                     num_of_latfeats=args.featurenum)
+                     nonparametric=args.nonparametric)
 
-# B_sampler = BSampler(likelihood=beta_posterior,
-#                      lam=args.alpha,
-#                      num_of_latfeats=Z_sampler.get_num_of_latfeats())
+print 'initializing B sampler'
 
+B_sampler = BSampler(B=initial_B,
+                     likelihood=beta_posterior,
+                     lmbda=args.lmbda,
+                     proposal_bandwidth=args.featloadingsproposalbandwidth)
 
 # model = FullGibbs(D_sampler, Z_sampler, B_sampler)
 # model.fit(args.iterations, args.burnin, args.thinning)

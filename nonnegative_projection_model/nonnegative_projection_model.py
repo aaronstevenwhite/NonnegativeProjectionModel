@@ -1,10 +1,10 @@
-import abc, warnings
+import abc, warnings, re
 import numpy as np
 import scipy as sp
 import theano
+import theano.tensor as T
 
 from scipy.optimize import minimize
-from sklearn.decomposition import ProjectedGradientNMF
 
 ##########
 ## data ##
@@ -12,18 +12,27 @@ from sklearn.decomposition import ProjectedGradientNMF
 
 class Data(object):
 
-    def _load_X(self, fname):
+    def _load_X(self, fname, obj_filter=lambda obj: not re.match('^(be|become|are)\s', obj)):
         data = np.loadtxt(fname, 
                           dtype=str, 
                           delimiter=',')
 
-        self.objects = data[1:,0]
-        self.features = data[0,1:]
-        self._X = data[1:,1:].astype(int)
+        objects = data[1:,0]
+        obsfeats = data[0,1:]
+        X = data[1:,1:].astype(int)
+
+        obj_filter_vectorized = np.vectorize(obj_filter)
+
+        objects_filtered = obj_filter_vectorized(objects)
+        obsfeats_filtered = X.sum(axis=0) > 0
+
+        self.objects = objects[objects_filtered]
+        self.obsfeats = obsfeats[obsfeats_filtered]
+        self._X = X[objects_filtered][:,obsfeats_filtered]
 
     def _initialize_ranges(self):
-        self._obj_range = range(self._X.shape[0])
-        self._obsfeat_range = range(self._X.shape[1])
+        self._obj_range = range(self.objects.shape[0])
+        self._obsfeat_range = range(self.obsfeats.shape[0])
 
     def get_data(self):
         return self._X
@@ -123,38 +132,61 @@ class PoissonGammaProductLikelihood(Likelihood):
     def __init__(self, data, gamma=1.):
         self.gamma = gamma
 
+        self._initialize_data(data)
+
+    def _initialize_data(self, data):
         self._data = data
-        self._X = data.get_data()
-        self._X_obj_count = data.get_obj_counts()
-        self._obj_range = data.get_obj_range()
-        self._obsfeat_range = data.get_obsfeat_range()
+
+        if isinstance(data, BatchData):
+            self._X = data.get_data()
+            self._X_obj_count = data.get_obj_counts()
+            self._obj_range = data.get_obj_range()
+            self._obsfeat_range = data.get_obsfeat_range()
+
+        elif isinstance(data, IncrementalData):
+            self._X_gen = data
+
+    def link_prior_params(self, D_inference):
+        self._D = D_inference.get_param()
 
     def get_data(self):
         return self._data.get_data()
 
-    def compute_log_likelihood(self, D, obj=None, obsfeat=None):
+    def _construct_indices(self, obj, obsfeat):
         obj = self._obj_range if obj == None else obj
         obsfeat = self._obsfeat_range if obsfeat == None else obsfeat
 
-        log_numer = np.sum(self._X[obj][:,obsfeat] * np.log(D[obj][:,obsfeat]), axis=1)
+        return obj, obsfeat
+
+    def _compute_ll_d_new(self, d_new, obj, obsfeat):
+        log_numer = self._X[obj,obsfeat] * np.log(d_new)
+
+        d_obj = np.insert(np.delete(self._D[obj], 
+                                    obsfeat), 
+                          obsfeat, 
+                          d_new)
 
         log_denom_X = 1 + self._X_obj_count[obj]
-        log_denom_D = np.log(self.gamma + D[obj].sum(axis=1))
+        log_denom_D = np.log(self.gamma + d_obj.sum())
+        log_denom = log_denom_X * log_denom_D
+
+        return log_numer - log_denom
+
+    def _compute_ll_D(self):
+        log_numer = np.sum(self._X * np.log(self._D), axis=1)
+
+        log_denom_X = 1 + self._X_obj_count[:,None]
+        log_denom_D = np.log(self.gamma + self._D.sum(axis=1))
         log_denom = log_denom_X * log_denom_D
 
         return np.sum(log_numer - log_denom)
 
-    def compute_log_likelihood_jacobian(self, D, obj=None, obsfeat=None):
-        obj = self._obj_range if obj == None else obj
-        obsfeat = self._obsfeat_range if obsfeat == None else obsfeat
 
-        first_term = self._X[obj][:,obsfeat] / D[obj][:,obsfeat]
-
-        second_term_numer = (1 + self._X_obj_count[obj])[:,None]
-        second_term_denom = (self.gamma + D[obj].sum(axis=1))[:,None]
-        second_term = second_term_numer / second_term_denom
-
-        return first_term - second_term
+    def compute_log_likelihood(self, d_new=None, obj=None, obsfeat=None):
+        if d_new == None:
+            return self._compute_ll_D()
+        else:
+            return self._compute_ll_d_new(d_new, obj, obsfeat)
 
 
 class BetaPosterior(Prior, Likelihood):
@@ -163,15 +195,17 @@ class BetaPosterior(Prior, Likelihood):
         self._D = D_inference.get_param()
         D_inference.link_prior(self)
 
+        self._B_inference = None
+
         self._Z = None
         self._B = None
 
     def link_prior_params(self, Z_inference=None, B_inference=None):
-        self._Z_inference = Z_inference
-        self._B_inference = B_inference
+        ## don't need to save Z_inference
+        self._B_inference = B_inference if B_inference != None else self._B_inference
 
-        self._Z = Z_inference.get_param() if Z_inference != None else None
-        self._B = B_inference.get_param() if B_inference != None else None
+        self._Z = Z_inference.get_param() if Z_inference != None else self._Z
+        self._B = B_inference.get_param() if B_inference != None else self._B
 
         if self._Z != None and self._B != None:
             self._ZB = np.dot(self._Z, self._B)
@@ -194,16 +228,19 @@ class BetaPosterior(Prior, Likelihood):
         elif param == 'B':
             return self._B
 
+        else:
+            raise ValueError('parameter must equal "Z" or "B"')
 
     def _compute_ll_z_new(self, z_new, obj, latfeat):
-        z_obj = np.insert(np.delete(self._Z[obj,:], 
+        z_obj = np.insert(np.delete(self._Z[obj], 
                                     latfeat), 
                           latfeat, 
                           z_new)
 
-        ZB_obj = np.dot(z_obj, self._B)
+        z_obj_B = np.dot(z_obj, self._B)
+        z_obj_b_latfeat = z_new * self._B[latfeat]
 
-        ll = np.log(ZB_obj) + (ZB_obj[latfeat] - 1)*np.log(self._D[obj])
+        ll = np.log(z_obj_B) + (z_obj_b_latfeat - 1)*np.log(self._D[obj])
             
         return np.sum(ll)
 
@@ -213,19 +250,23 @@ class BetaPosterior(Prior, Likelihood):
                               latfeat, 
                               b_new)
 
-        ZB_obsfeat = np.dot(self._Z, b_obsfeat)
+        Zb_obsfeat = np.dot(self._Z, b_obsfeat)
+        z_latfeat_b_obsfeat = b_new * self._Z[:,latfeat]
 
-        ll = np.log(ZB_obsfeat) + (ZB_obsfeat[latfeat] - 1)*np.log(self._D[:,obsfeat])
+        ll = np.log(Zb_obsfeat) + (z_latfeat_b_obsfeat - 1)*np.log(self._D[:,obsfeat])
 
         return np.sum(ll)
 
-    def _compute_ll_B(self, B):
-        ZB = np.dot(self._Z, B)
+    def _compute_ll(self, Z=None, B=None):
+        Z = self._Z if Z == None else Z
+        B = self._B if B == None else B
+
+        ZB = np.dot(Z, B)
         self._log_likelihood = np.log(ZB) + (ZB - 1) * np.log(self._D)
 
         return np.sum(self._log_likelihood)
 
-    def compute_log_likelihood(B=None, z_new=None, b_new=None, 
+    def compute_log_likelihood(self, Z=None, B=None, z_new=None, b_new=None, 
                                obj=None, latfeat=None, obsfeat=None):
         if z_new != None:
             return self._compute_ll_z_new(z_new, obj, latfeat)
@@ -233,14 +274,33 @@ class BetaPosterior(Prior, Likelihood):
         elif b_new != None:
             return self._compute_ll_b_new(b_new, latfeat, obsfeat)
 
-        else:
+        elif B!= None:
             ## this would not be necessary if we weren't
             ## doing optimization for B since it could be
             ## done using self._B
-            return self._compute_ll_B(B)
+            return self._compute_ll(B=B)
+
+        elif Z!= None:
+            ## this would not be necessary if we weren't
+            ## doing optimization for B since it could be
+            ## done using self._B
+            return self._compute_ll(Z=Z)
+
+        else:
+            self._update_log_likelihood_values()
+            return self._log_likelihood_values[obj, obsfeat]
+
+    def compute_log_likelihood_jacobian(self, B):
+        one_over_ZB = 1. / np.dot(self._Z, B)
+        log_D = np.log(self._D)
+
+        inner_sum = (one_over_ZB + log_D).sum(axis=1)
+        outer_sum = (self._Z * inner_sum[:,None]).sum(axis=0)
+
+        return B * outer_sum[:,None]
 
     def _update_log_likelihood_values(self):
-        self._log_likelihood = np.log(self._ZB) + (self._ZB - 1) * np.log(self._D)
+        self._log_likelihood_values = np.log(self._ZB) + (self._ZB - 1) * np.log(self._D)
 
     def _update_log_prior_values(self):
         self._log_prior_values = (self._ZB - 1) * np.log(self._D)
@@ -258,6 +318,7 @@ class BetaPosterior(Prior, Likelihood):
             return np.sum(lp)
 
         else:
+            self._update_log_prior_values()
             return self._log_prior_values[obj, obsfeat]
 
 ###########
@@ -277,22 +338,22 @@ class Sampler(object):
 
 class DSampler(Sampler):
     
-    def __init__(self, likelihood, proposal_bandwidth=1., optimizer='L-BFGS-B'):
+    def __init__(self, D, likelihood, proposal_bandwidth):
+        self._initialize_D(D, likelihood)
+        self._initialize_ranges()
+        self._initialize_proposer(proposal_bandwidth)
+
+    def _initialize_D(self, initial_D, likelihood):
+        self._D = initial_D
         self._log_likelihood = likelihood.compute_log_likelihood
 
-        ## this smoother should really be data dependent 
-        ## so as not to yield something below the optimizer bounds
-        X = likelihood.get_data() + 10e-10 
-        initial_D = X.astype(float)/X.sum(axis=1)[:,None]
+        likelihood.link_prior_params(D_inference=self)
 
-        jacobian = likelihood.compute_log_likelihood_jacobian
-        self._D = self._MLE_optimize(initial_D, jacobian, optimizer)
-
-        ## initialize ranges so they don't have to 
-        ## be recomputed each time a range is needed
+    def _initialize_ranges(self):
         self._obj_range = range(self._D.shape[0])
         self._obsfeat_range = range(self._D.shape[1])
 
+    def _initialize_proposer(self, proposal_bandwidth):
         ## find point-wise min of D and 1-D
         D_minimum = np.minimum(self._D, 1-self._D)
 
@@ -300,27 +361,6 @@ class DSampler(Sampler):
         self._proposal_bandwidth = proposal_bandwidth
         self._proposal_window = D_minimum / proposal_bandwidth
         self._log_proposal_prob_values = np.log(D_minimum)
-
-    def _MLE_optimize(self, initial_D, jacobian, optimizer):
-        if optimizer:
-            D_shape = initial_D.shape
-
-            ll_flattened = lambda D: -self._log_likelihood(D.reshape(D_shape))
-            ll_jac_flattened = lambda D: -jacobian(D.reshape(D_shape)).flatten()
-
-            bounds = [(1e-20,1.-1e-20)]*np.prod(D_shape)
-
-            solution = minimize(fun=ll_flattened,
-                                x0=initial_D.flatten(),
-                                jac=ll_jac_flattened,
-                                bounds=bounds,
-                                method=optimizer)
-
-            return solution.x.reshape(D_shape)
-        
-        else:
-            warnings.warn('No optimizer specified; D will not be initialized with optimization')
-            return initial_D
 
     def get_param(self):
         return self._D
@@ -336,13 +376,13 @@ class DSampler(Sampler):
                              obj=obj, 
                              obsfeat=obsfeat)
 
-        return log_like + log_prior
+        return ll + lp
 
     def _compute_lp_D(self, D):
-        ll =  self._log_likelihood(D=D)
+        ll =  self._log_likelihood()
         lp = self._log_prior(D=D)            
 
-        return log_like + log_prior            
+        return ll + lp            
 
     def _compute_log_posterior(self, D=None, d_new=None, obj=None, obsfeat=None):
         if d_new != None:
@@ -357,8 +397,8 @@ class DSampler(Sampler):
     def _proposer(self, obj, obsfeat):
         window_size = self._proposal_window[obj, obsfeat]
         
-        return np.random.uniform(low=d_mn_old-window_size, 
-                                 high=d_mn_old+window_size)
+        return np.random.uniform(low=self._D[obj,obsfeat]-window_size, 
+                                 high=self._D[obj,obsfeat]+window_size)
 
     def _log_proposal_prob(self, obj, obsfeat, proposal=None):
         if proposal == None:
@@ -368,14 +408,14 @@ class DSampler(Sampler):
             return np.log(np.min([proposal, 1-proposal]))
 
     def _acceptance_prob(self, proposal, obj, obsfeat):
-        current_log_post_val = self._compute_log_posterior(obj, obsfeat) 
-        proposal_log_post_val = self._compute_log_posterior(obj, obsfeat, proposal) 
+        current_log_post_val = self._compute_log_posterior(obj=obj, obsfeat=obsfeat) 
+        proposal_log_post_val = self._compute_log_posterior(d_new=proposal, obj=obj, obsfeat=obsfeat) 
 
         log_post_ratio = current_log_post_val - proposal_log_post_val 
 
         ## transition probabilities are confusing:
-        ## the first is really log(p(new->old))
-        ## and the second is really log(p(old-new))
+        ## the first is really propto log(p(new->old))
+        ## and the second is really propto log(p(old->new))
         ## without constants
         current_log_prop_val = self._log_proposal_prob(obj, obsfeat) 
         proposal_log_prop_val = self._log_proposal_prob(obj, obsfeat, proposal) 
@@ -384,29 +424,29 @@ class DSampler(Sampler):
 
         return log_post_ratio + log_proposal_ratio
 
-    def _sample(obj, obsfeat):
+    def _update_D(proposal, obj, obsfeat):
+        self._D[obj, obsfeat] = proposal
+
+        d_obj_obsfeat_min = np.min([proposal, 1-proposal])
+        self._proposal_window[obj, obsfeat] = d_obj_obsfeat_min / self._proposal_bandwidth
+        self._log_proposal_prob_values[obj, obsfeat] = np.log(d_obj_obsfeat_min)
+
+    def _sample(self, obj, obsfeat):
         proposal = self._proposer(obj, obsfeat)
 
         acceptance_log_prob = self._acceptance_prob(proposal, obj, obsfeat)
-        acceptance_log_prob = np.min([0, acceptance_prob])
+        acceptance_log_prob = np.min([0, acceptance_log_prob])
 
         accept = np.log(np.random.uniform(low=0., high=1.)) < acceptance_log_prob
 
         if accept:
             self._update_D(proposal, obj, obsfeat)
 
-    def _update_D(proposal, obj, obsfeat):
-        self._D[obj, obsfeat] = proposal
-
-        d_obj_obsfeat_min = np.min([proposal, 1-proposal])
-        self._proposal_window[obj, obsfeat] = d_obj_obsfeat_min / self.proposal_bandwidth
-        self._log_proposal_prob_values[obj, obsfeat] = np.log(d_obj_obsfeat_min)
-
     def _update_log_posterior_values(self):
         log_prior_vals = self._log_prior(self._obj_range, self._obsfeat_range)
-        log_post_vals = self._log_likelihood(self._D)
+        log_like_vals = self._log_likelihood()
 
-        self._log_posterior_values = log_prior_vals + log_post_vals
+        self._log_posterior_values = log_prior_vals + log_like_vals
 
     def sample(self):
         self._update_log_posterior_values()
@@ -414,8 +454,6 @@ class DSampler(Sampler):
         for obj in self._obj_range:
             for obsfeat in self._obsfeat_range:
                 self._sample(obj, obsfeat)
-
-
 
 
 class ZSampler(Sampler):
@@ -427,7 +465,7 @@ class ZSampler(Sampler):
       alpha
     """
     
-    def __init__(self, likelihood, alpha, beta=1., num_of_latfeats=0, optimize=True):
+    def __init__(self, Z, likelihood, alpha, beta=1., nonparametric=False):
         """
         Initialize the verb-by-latent binary feature sampler
 
@@ -441,69 +479,66 @@ class ZSampler(Sampler):
         self.alpha = alpha
         self.beta = beta
 
-        self._num_of_objects = likelihood.get_data().shape[0]
-        self._poisson_param = float(alpha/self._num_of_objects)
+        self.nonparametric = nonparametric
 
-        self._initialize_Z(likelihood, num_of_latfeats, optimize)
-        self._initialize_likelihood(likelihood)
+        self._initialize_Z(Z, likelihood)
+        self._initialize_ranges()
 
-    def _initialize_Z(self, likelihood, num_of_latfeats, optimize):
-        D = likelihood.get_data()
+        if nonparametric:
+            self._poisson_param = float(alpha/self._num_of_objects)
 
-        if num_of_latfeats:
-            self._num_of_latfeats = num_of_latfeats
-        else:
-            self._num_of_latfeats = D.shape[1]/10
 
-        if optimize:
-            self._Z = self._thresholded_nmf(D)
-        else:
-            feature_prob = 1. / (1+np.exp(-self.alpha))
-            self._Z = sp.stats.bernoulli.rvs(feature_prob, 
-                                             size=[self._num_of_objects, 
-                                                   self._num_of_latfeats])
+    def _initialize_ranges(self):
+        self._num_of_objects, self._num_of_latfeats = self._Z.shape
 
+        self._obj_range = range(self._num_of_objects)
+        self._latfeat_range = range(self._num_of_latfeats)
+
+    def _initialize_Z(self, Z, likelihood):
+        self._Z = np.where(Z > .5, 1, 0)
+
+        likelihood.link_prior_params(Z_inference=self)
+        self._log_likelihood = likelihood.compute_log_likelihood
+        
         self._update_feature_counts()
 
-    def _thresholded_nmf(self, D):
-        nmf_model = ProjectedGradientNMF(n_components=self._num_of_latfeats, 
-                                         init='random')
-        nmf_score_matrix = nmf_model.fit_transform(-1./np.log(D))
-
-        threshold = np.percentile(nmf_score_matrix, 
-                                  100. / (1+np.exp(-self.alpha)))
-        
-        return np.where(nmf_score_matrix > threshold, 1., 0.)
-
-    def _initialize_likelihood(self, likelihood):
-        likelihood.link_prior_params(Z_inference=self)
-        
-        self._log_likelihood = likelihood.compute_log_likelihood
-        self._compress_other_matrices = likelihood.compress_other_matrices
-        self._append_to_other_matrices = likelihood.append_to_other_matrices
-
+        if self.nonparametric:
+            self._compress_other_matrices = likelihood.compress_other_matrices
+            self._append_to_other_matrices = likelihood.append_to_other_matrices
 
     def _update_feature_counts(self, z_new=None, obj=None, latfeat=None):
         if z_new == None:
             self._feature_counts = self._Z.sum(axis=0)
-            self._update_log_counts_minus_obj()
+            self._update_log_prior_values()
 
         elif z_new != self._Z[obj, latfeat]:
             self._feature_counts[obj, latfeat] += self._Z[obj, latfeat] - z_new
-            self._update_log_counts_minus_obj(obj)
+            self._update_log_prior_values(obj)
 
-    def _update_log_counts_minus_obj(self, obj=None):
+    def _update_log_prior_values(self, obj=None):
+        V = self._Z.shape[0]
+
+        if self.nonparametric:
+            smoothing = np.array([V-1., 0.])
+        else:
+            smoothing = np.array([self.beta + V - 1., self.alpha])
+
         if obj == None:
-            self._log_counts_minus_obj = np.log(self._feature_counts[None,:] - self._Z)
+            feature_count_minus_obj = self._feature_counts[None,:] - self._Z
+            counts_smoothed = smoothing[:,None,None] + np.array([-1, 1])[:,None,None] * feature_count_minus_obj
+
+            self._log_prior_values = np.log(counts_smoothed)
 
         else:
-            self._log_counts_minus_obj[obj] = np.log(self._feature_counts - self._Z[obj])
+            feature_count_minus_obj = self._feature_counts - self._Z[obj]
+            counts_smoothed = smoothing[:,None] + np.array([-1, 1])[:,None] * feature_count_minus_obj
 
+            self._log_prior_values[obj] = np.log(counts_smoothed)
 
     def _compute_log_posterior(self, z_new, obj, latfeat):
         log_likelihood = self._log_likelihood(z_new=z_new, obj=obj, latfeat=feat)
 
-        return self._log_counts_minus_obj[obj, latfeat] + log_likelihood
+        return self._log_prior_values[z_new, obj, latfeat] + log_likelihood
 
 
     def _compress(self):
@@ -518,7 +553,7 @@ class ZSampler(Sampler):
         num_of_new_latfeats = sp.stats.poisson.rvs(mu=self._poisson_param)
 
         if num_of_new_latfeats:
-            new_latfeats = np.zeros([num_of_objects, num_of_new_latfeats])
+            new_latfeats = np.zeros([self._num_of_objects, num_of_new_latfeats])
             new_latfeats[obj] += 1
 
             self._Z = np.append(self._Z, new_latfeats, axis=1)
@@ -531,6 +566,9 @@ class ZSampler(Sampler):
     def get_num_of_latfeats(self):
         return self._Z.shape[1]
 
+    def get_param(self):
+        return self._Z
+
     def _sample(self, obj, latfeat):
         logpost_on = self._compute_log_posterior(1, obj, latfeat)
         logpost_off = self._compute_log_posterior(0, obj, latfeat)
@@ -541,49 +579,120 @@ class ZSampler(Sampler):
 
     def sample(self):
         for obj in self._obj_range:
-            self._update_log_counts_minus_obj(obj)
+            self._update_prior_values(obj)
 
             for latfeat in self._latfeat_range:
                 new = self._sample(obj, latfeat)
                 self._update_feature_counts(new, obj, latfeat)
                 self._Z[obj, latfeat] = new
 
-            self._compress()
-            self._append_new_latfeats(obj)
+            if self.nonparametric:
+                self._compress()
+                self._append_new_latfeats(obj)
 
 
 class BSampler(Sampler):
 
-    def __init_(self, likelihood, lam, num_of_latfeats, optimize=True):
-        self.lambda = lam
+    def __init__(self, B, likelihood, lmbda, proposal_bandwidth):
+        self.lmbda = lmbda
 
-        self._num_of_latfeats = num_of_latfeats
-        self._num_of_obsfeats = likelihood.get_data().shape[1]
+        self._initialize_B(B, likelihood)
+        self._initialize_ranges()
+        self._initialize_proposer(proposal_bandwidth)
 
-        self._initialize_B(likelihood, num_of_latfeats, optimize)    
-        self._initialize_likelihood(likelihood)
-
-    def _initialize_likelihood(self, likelihood):
-        likelihood.link_prior_params(B_inference=self)
-        
+    def _initialize_B(self, B, likelihood):
         self._log_likelihood = likelihood.compute_log_likelihood
+        self._B = B
 
-    def _initialize_Z(self, likelihood, num_of_latfeats, optimize):
-        D = likelihood.get_data()
+        likelihood.link_prior_params(B_inference=self)
 
-        if optimize:
-            self._B = self._MAP_optimize(D)
+    def _initialize_ranges(self):
+        self._num_of_latfeats, self._num_of_obsfeats = self._B.shape
+
+        self._latfeat_range = range(self._num_of_latfeats)
+        self._obsfeat_range = range(self._num_of_obsfeats)
+
+    def _initialize_proposer(self, proposal_bandwidth):
+        self._proposal_bandwidth = proposal_bandwidth
+        self._proposal_window = self._B / proposal_bandwidth
+        self._log_proposal_prob_values = np.log(self._B)
+
+    def _compute_lp_b_new(self, b_new, latfeat, obsfeat):
+        ll =  self._log_likelihood(b_new=b_new, 
+                                   latfeat=latfeat, 
+                                   obsfeat=obsfeat)
+        lp = -self.lmbda * b_new
+
+        return log_like + log_prior
+
+    def _compute_lp_B(self, B):
+        ll =  self._log_likelihood(B=B)
+        lp = -self.lmbda * B
+
+        return log_like + log_prior            
+
+    def _compute_log_posterior(self, B=None, b_new=None, latfeat=None, obsfeat=None):
+        if b_new != None:
+            return self._compute_lp_b_new(b_new, obj, obsfeat)
+
+        elif B != None:
+            return self._compute_lp_B(B)
+
         else:
-            Z = likelihood.get_param('Z')
-            self._B = np.dot(Z.T, D)
+            return self._log_posterior_values[latfeat, obsfeat]
 
-        self._update_feature_counts()
+    def _proposer(self, latfeat, obsfeat):
+        window_size = self._proposal_window[latfeat, obsfeat]
+        
+        return np.random.uniform(low=self._B[latfeat,obsfeat]-window_size, 
+                                 high=self._B[latfeat,obsfeat]+window_size)
 
-    def _MAP_optimize(self, D):
-        raise NotImplementedError
+    def _log_proposal_prob(self, latfeat, obsfeat, proposal=None):
+        if proposal == None:
+            return self._log_proposal_prob_values[latfeat, obsfeat]
 
-    def compress(self, latfeat_gt_0):
-        self._B = self._B[latfeat_gt_0]
+        else:
+            return np.log(proposal)
+
+    def _acceptance_prob(self, proposal, latfeat, obsfeat):
+        current_log_post_val = self._compute_log_posterior(latfeat, obsfeat) 
+        proposal_log_post_val = self._compute_log_posterior(latfeat, obsfeat, proposal) 
+
+        log_post_ratio = current_log_post_val - proposal_log_post_val 
+
+        ## transition probabilities are confusing:
+        ## the first is really log(p(new->old))
+        ## and the second is really log(p(old->new))
+        ## without constants
+        current_log_prop_val = self._log_proposal_prob(latfeat, obsfeat) 
+        proposal_log_prop_val = self._log_proposal_prob(latfeat, obsfeat, proposal) 
+
+        log_proposal_ratio = current_log_prop_val - proposal_log_prop_val
+
+        return log_post_ratio + log_proposal_ratio
+
+    def _update_B(proposal, latfeat, obsfeat):
+        self._B[latfeat, obsfeat] = proposal
+
+        self._proposal_window[latfeat, obsfeat] = proposal / self._proposal_bandwidth
+        self._log_proposal_prob_values[latfeat, obsfeat] = np.log(proposal)
+
+    def _sample(self, latfeat, obsfeat):
+        proposal = self._proposer(latfeat, obsfeat)
+
+        acceptance_log_prob = self._acceptance_prob(proposal, latfeat, obsfeat)
+        acceptance_log_prob = np.min([0, acceptance_prob])
+
+        accept = np.log(np.random.uniform(low=0., high=1.)) < acceptance_log_prob
+
+        if accept:
+            self._update_B(proposal, latfeat, obsfeat)
+
+    def _update_log_posterior_values(self):
+        log_like_vals = self._log_likelihood(B=self._B)
+        log_prior_vals = -self.lmbda*self._B
+
+        self._log_posterior_values = log_prior_vals + log_like_vals
 
     def sample(self):
         self._update_log_posterior_values()
@@ -591,6 +700,12 @@ class BSampler(Sampler):
         for latfeat in self._latfeat_range:
             for obsfeat in self._obsfeat_range:
                 self._sample(latfeat, obsfeat)
+
+    def get_param(self):
+        return self._B
+
+    def compress(self, latfeat_gt_0):
+        self._B = self._B[latfeat_gt_0]
 
 
 
@@ -601,16 +716,83 @@ class BSampler(Sampler):
 class Optimizer(object):
     
     @abc.abstractmethod
-    def _MLE_optimize(self):
-        return
-
-    @abc.abstractmethod
-    def _MAP_optimize(self):
-        return
-
-    @abc.abstractmethod
     def optimize(self):
         return
+
+class JointOptimizer(Optimizer):
+
+    def __init__(self, data, learning_rate=0.99, gamma=1., lmbda=1.):
+        self._X = data.get_data().astype(theano.config.floatX)
+
+        self._learning_rate = learning_rate
+        self._gamma = gamma
+        self._lmbda = lmbda
+
+    def _initialize_shared_variables(self):
+        obj, obsfeat = self._X.shape
+
+        D = np.random.beta(1., 1., [obj, obsfeat]).astype(theano.config.floatX)
+        Z = np.random.beta(1., 1., [obj, latfeat]).astype(theano.config.floatX)
+        B = np.random.exponential(1., [latfeat, obsfeat]).astype(theano.config.floatX)
+
+        self._tX = theano.shared(self._X, name='X')
+        self._tD = theano.shared(D, name='D')
+        self._tZ = theano.shared(Z, name='Z')
+        self._tB = theano.shared(B, name='B')
+
+        self._tZB = T.dot(tZ, tB)
+
+    def optimize(self, X, latfeat, maxiter, subiter):
+        gamma_poisson_numer = T.sum(self._tX * T.log(self._tD), axis=1)
+        gamma_poisson_denom = (1 + T.sum(self._tX, axis=1))*T.log(self._gamma+T.sum(self._tD, axis=1))
+
+        gamma_poisson = T.sum(gamma_poisson_numer - gamma_poisson_denom)
+        beta_D = T.sum(T.log(self._tZB) + (self._tZB-1.)*T.log(self._tD))
+        exp_B = T.sum(-self._lmbda*self._tB)
+
+        log_likelihood = theano.function([], gamma_poisson)
+        log_posterior = theano.function([], gamma_poisson+beta_D+exp_B)
+
+        gradient_MLE_D = T.tanh(T.grad(gamma_poisson, self._tD))
+        gradient_MAP_D = T.tanh(T.grad(beta_D + gamma_poisson, self._tD))
+        gradient_Z = T.tanh(T.grad(beta_D, self._tZ))
+        gradient_B = T.tanh(T.grad(exp_B + beta_D, self._tB))
+
+        step_size_D = learning_rate * (T.minimum(self._tD, 1.-self._tD) - 1e-20)
+        step_size_Z = learning_rate * (T.minimum(self._tZ, 1.-self._tZ) - 1e-20)
+        step_size_B = learning_rate * T.minimum(self._tB, T.abs_(T.log(self._tB))+1.)
+
+        update_MLE_D = theano.function(inputs=[],
+                                       outputs=[],
+                                       updates={tD:tD+step_size_D*gradient_MLE_D},
+                                       name='update_MLE_D')
+        update_MAP_D = theano.function(inputs=[],
+                                       outputs=[],
+                                       updates={tD:tD+step_size_D*gradient_MAP_D},
+                                       name='update_MAP_D')
+        update_Z = theano.function(inputs=[],
+                                   outputs=[],
+                                   updates={tZ:tZ+step_size_Z*gradient_Z},
+                                   name='update_Z')
+        update_B = theano.function(inputs=[],
+                                   outputs=[],
+                                   updates={tB:tB+step_size_B*gradient_B},
+                                   name='update_B')
+
+        for i in np.arange(subiter):
+            # sys.stdout.write("unnormalized log likelihood: %d%%   \r" % (log_likelihood()) )
+            # sys.stdout.flush()
+
+            update_MLE_D()
+
+        for i in np.arange(maxiter):
+            for j in np.arange(subiter):
+                update_B()
+                update_Z()
+            for j in np.arange(subiter):
+                update_MAP_D()
+
+        return self._tD.get_value(), self._tZ.get_value(), self._tB.get_value()
 
 class DOptimizer(Optimizer):
 
@@ -659,7 +841,41 @@ class Model(object):
 
 class FullGibbs(Model):
 
-    def __init__(self, D_sampler, Z_Sampler, B_Sampler):
+    def __init__(self, data, num_of_latfeats):
+        
+        num_of_latfeats = num_of_latfeats if num_of_latfeats else 100
+
+        initial_D, initial_Z, initial_B = initialize_D_Z_B(data.get_data(),
+                                                           num_of_latfeats,
+                                                           maxiter=100,
+                                                           subiter=100)
+
+        data_likelihood = PoissonGammaProductLikelihood(data=data,
+                                                        gamma=args.gamma)
+
+        print 'initializing D sampler'
+
+        D_sampler = DSampler(D=initial_D,
+                             likelihood=data_likelihood, 
+                             proposal_bandwidth=args.distributionproposalbandwidth)
+
+        beta_posterior = BetaPosterior(D_inference=D_sampler)
+
+        print 'initializing Z sampler'
+
+        Z_sampler = ZSampler(Z=initial_Z,
+                             likelihood=beta_posterior,
+                             alpha=args.alpha,
+                             nonparametric=args.nonparametric)
+
+        print 'initializing B sampler'
+
+        B_sampler = BSampler(B=initial_B,
+                             likelihood=beta_posterior,
+                             lmbda=args.lmbda,
+                             proposal_bandwidth=args.featloadingsproposalbandwidth)
+
+
         self._D_sampler = D_sampler
         self._Z_sampler = Z_sampler
         self._B_sampler = B_sampler
