@@ -714,118 +714,188 @@ class BSampler(Sampler):
 ################
 
 class Optimizer(object):
+
+    def __init__(self, data, learning_rate=0.99):
+        self._data = data.get_data().astype(theano.config.floatX)
+        self._learning_rate = learning_rate
+        self._num_of_rows, self._num_of_columns = self._X.shape
     
     @abc.abstractmethod
     def optimize(self):
         return
 
-class JointOptimizer(Optimizer):
+    @abc.abstractmethod
+    def _construct_shared(self):
+        return 
 
-    def __init__(self, data, learning_rate=0.99, gamma=1., lmbda=1.):
-        self._X = data.get_data().astype(theano.config.floatX)
 
-        self._learning_rate = learning_rate
-        self._gamma = gamma
-        self._lmbda = lmbda
+class DOptimizer(Optimizer):
 
-    def _initialize_shared_variables(self):
-        obj, obsfeat = self._X.shape
-
-        D = np.random.beta(1., 1., [obj, obsfeat]).astype(theano.config.floatX)
-        Z = np.random.beta(1., 1., [obj, latfeat]).astype(theano.config.floatX)
-        B = np.random.exponential(1., [latfeat, obsfeat]).astype(theano.config.floatX)
-
+    def __init__(self, X, gamma):
+        self._X = X.astype(theano.config.floatX)
+        self._D = np.random.beta(1., 1., X.shape).astype(theano.config.floatX)
+        
         self._tX = theano.shared(self._X, name='X')
-        self._tD = theano.shared(D, name='D')
-        self._tZ = theano.shared(Z, name='Z')
-        self._tB = theano.shared(B, name='B')
+        self._tD = theano.shared(self._D, name='D')
 
-        self._tZB = T.dot(tZ, tB)
+        self._likelihood_objective = self._construct_likelihood_objective(gamma)
+        self._MLE_updater = self._construct_updater(self._likelihood_objective)
 
-    def optimize(self, X, latfeat, maxiter, subiter):
-        gamma_poisson_numer = T.sum(self._tX * T.log(self._tD), axis=1)
-        gamma_poisson_denom = (1 + T.sum(self._tX, axis=1))*T.log(self._gamma+T.sum(self._tD, axis=1))
+    def get_tD(self):
+        return self._tD
 
-        gamma_poisson = T.sum(gamma_poisson_numer - gamma_poisson_denom)
-        beta_D = T.sum(T.log(self._tZB) + (self._tZB-1.)*T.log(self._tD))
-        exp_B = T.sum(-self._lmbda*self._tB)
+    def _construct_likelihood_objective(self, gamma):
+        tX, tD = self._tX, self._tD
 
-        log_likelihood = theano.function([], gamma_poisson)
-        log_posterior = theano.function([], gamma_poisson+beta_D+exp_B)
+        gamma_poisson_numer = T.sum(tX * T.log(tD), axis=1)
+        gamma_poisson_denom = (1 + T.sum(tX, axis=1))*T.log(gamma+T.sum(tD, axis=1))
 
-        gradient_MLE_D = T.tanh(T.grad(gamma_poisson, self._tD))
-        gradient_MAP_D = T.tanh(T.grad(beta_D + gamma_poisson, self._tD))
-        gradient_Z = T.tanh(T.grad(beta_D, self._tZ))
-        gradient_B = T.tanh(T.grad(exp_B + beta_D, self._tB))
+        return T.sum(gamma_poisson_numer - gamma_poisson_denom)
 
-        step_size_D = learning_rate * (T.minimum(self._tD, 1.-self._tD) - 1e-20)
+    def _construct_prior_objective(self, tZB):
+        tD = self._tD
+
+        return T.sum(T.log(tZB) + (tZB-1.)*T.log(tD))
+
+    def _construct_posterior_objective(self, tZB):
+        tX, tD = self._tX, self._tD
+
+        log_prior = self._construct_prior_objective(tZB)
+        log_likelihood = self._likelihood_objective
+
+        return log_prior + log_likelihood
+
+    def _construct_updater(self, objective):
+        tD = self._tD
+
+        gradient = T.tanh(T.grad(objective, tD))
+
+        step_size_D = learning_rate * (T.minimum(tD, 1.-tD)-1e-20)
+
+        return theano.function(inputs=[],
+                               outputs=[],
+                               updates={tD:tD+step_size_D*gradient},
+                               name='update_D')
+
+    def set_prior_param(self, tZB):
+        self._tZB = tZB
+        self._posterior_objective = self._construct_posterior_objective(tZB)
+        self._MAP_updater = self._construct_updater(self._posterior_objective)
+
+    def get_prior_objective(self):
+        return self._construct_prior_objective
+
+    def get_values(self):
+        self._D = self._tD.get_value()
+
+        return self._D
+    
+    def optimize(self, maxiter=100, objective='MAP'):
+        if objective_type=='MAP':
+            updater = self._MAP_updater  
+        else:
+            updater = self._MLE_updater
+            
+        for i in np.arange(maxiter):
+            updater()
+
+class ZBOptimizer(Optimizer):
+
+    def __init__(self, D_optimizer, num_of_objects, num_of_obsfeats, num_of_latfeats, lmbda):
+        shape_Z = [num_of_objects, num_of_latfeats]
+        shape_B = [num_of_latfeats, num_of_obsfeats]
+
+        self._Z = np.random.beta(1., 1., shape_Z).astype(theano.config.floatX)
+        self._B = np.random.exponential(1., shape_B).astype(theano.config.floatX)
+
+        self._tZ = theano.shared(self._Z, name='Z')
+        self._tB = theano.shared(self._B, name='B')
+        self._tZB = T.dot(self._tZ, self._tB)
+
+        D_optimizer.set_prior_param(self._tZB)
+        
+        self._posterior_objective = self._construct_posterior_objective(D_optimizer, lmbda)
+        self._MAP_updater_Z, self._MAP_updater_B = self._construct_updater(self._posterior_objective)
+        
+    def _construct_prior_objective(self, lmbda):
+        return T.sum(-lmbda*self._tB)
+        
+    def _construct_likelihood_objective(self, D_optimizer):
+        return D_optimizer.get_prior_objective()
+
+    def _construct_posterior_objective(self, D_optimizer, lmbda):
+
+        log_prior = self._construct_prior_objective(lmbda)
+        log_likelihood = self._construct_likelihood_objective(D_optimizer)
+
+        return log_prior + log_likelihood
+
+    def _construct_updater(self, objective):
+        tZ = self._tZ
+        tB = self._tB
+
+        gradient_Z = T.tanh(T.grad(objective, tZ))
+        gradient_B = T.tanh(T.grad(objective, tB))
+
         step_size_Z = learning_rate * (T.minimum(self._tZ, 1.-self._tZ) - 1e-20)
-        step_size_B = learning_rate * T.minimum(self._tB, T.abs_(T.log(self._tB))+1.)
+        step_size_B = learning_rate * T.minimum(tB, T.abs_(T.log(tB))+1.)
 
-        update_MLE_D = theano.function(inputs=[],
-                                       outputs=[],
-                                       updates={tD:tD+step_size_D*gradient_MLE_D},
-                                       name='update_MLE_D')
-        update_MAP_D = theano.function(inputs=[],
-                                       outputs=[],
-                                       updates={tD:tD+step_size_D*gradient_MAP_D},
-                                       name='update_MAP_D')
         update_Z = theano.function(inputs=[],
                                    outputs=[],
                                    updates={tZ:tZ+step_size_Z*gradient_Z},
                                    name='update_Z')
         update_B = theano.function(inputs=[],
                                    outputs=[],
-                                   updates={tB:tB+step_size_B*gradient_B},
+                                   updates={tB:tB+step_size_B*gradient},
                                    name='update_B')
 
-        for i in np.arange(subiter):
-            # sys.stdout.write("unnormalized log likelihood: %d%%   \r" % (log_likelihood()) )
-            # sys.stdout.flush()
+        return update_Z, update_B
 
-            update_MLE_D()
+    def reset_Z(self, Z):
+        self._Z = Z
+        self._tZ.set_value(self._Z)
+
+    def get_values(self):
+        self._Z, self._B = self._tZ.get_value(), self._tB.get_value()
+        
+        return self._tZ.get_value(), self._tB.get_value()
+        
+    def optimize(self, maxiter=100, subiter=100):
+        updater_Z, updater_B = self._MAP_updater_Z, self._MAP_updater_B  
 
         for i in np.arange(maxiter):
             for j in np.arange(subiter):
-                update_B()
-                update_Z()
+                updater_Z()
             for j in np.arange(subiter):
-                update_MAP_D()
-
-        return self._tD.get_value(), self._tZ.get_value(), self._tB.get_value()
-
-class DOptimizer(Optimizer):
-
-    def __init_(self):
-        raise NotImplementedError
-
-    def _MAP_optimize(self):
-        D_shape = self._D.shape
-
-        lp = lambda D: self._log_likelihood(D) + self._log_prior(D)
-        lp_flattened = lambda D: -lp(D.reshape(D_shape))
-
-        lp_jac = lambda D: self._log_likelihood_jacobian(D) + self._log_prior_jacobian(D)
-        lp_jac_flattened = lambda D: -lp_jac(D.reshape(D_shape)).flatten()
-
-        bounds = [(10e-20,1.-10e-20)]*np.prod(D_shape)
-
-        return minimize(fun=lp_flattened,
-                        x0=initial_D.flatten(),
-                        jac=lp_jac_flattened,
-                        bounds=bounds,
-                        method=self.optimizer).reshape(D_shape)
-
-    def initialize_prior(self, prior):
-        self._log_prior = prior.compute_log_prior
-        self._log_prior_jacobian = prior.compute_log_prior_jacobian
+                updater_B()
 
 
+class JointOptimizer(Optimizer):
 
-class BOptimizer(Optimizer):
+    def __init__(self, X, num_of_latfeats, gamma, lmbda):
+        num_of_objects, num_of_obsfeats = X.shape
 
-    def __init_(self):
-        raise NotImplementedError
+        self._D_optimizer = DOptimizer(X, gamma)
+        self._ZB_optimizer = ZBOptimizer(D_optimizer,
+                                         num_of_objects,
+                                         num_of_latfeats,
+                                         num_of_obsfeats,
+                                         lmbda)
+
+    def get_values(self):
+        D = self._D_optimizer.get_values()
+        Z, B = self._ZB_optimizer.get_values()
+
+        return D, Z, B
+        
+    def optimize(self, maxiter, subiter):
+        ## initialize D with MLE estimate
+        self._D_optimizer.optimize(maxiter=subiter, objective='MLE')
+
+        for i in np.arange(maxiter):
+            self._ZB_optimizer(maxiter=1, subiter=subiter)
+            self._D_optimizer.optimize(maxiter=subiter, objective='MAP')
+
 
 
 ####################
