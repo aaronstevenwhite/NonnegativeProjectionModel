@@ -63,13 +63,13 @@ parser.add_argument('--loaddistributions',
                     default=False)
 
 ## optimization parameters
-parser.add_argument('--optimizeobjectfeatures', 
+parser.add_argument('--sampleobjectfeatures', 
                     type=bool, 
                     default=False)
-parser.add_argument('--optimizefeatureloadings', 
+parser.add_argument('--samplefeatureloadings', 
                     type=bool, 
                     default=False)
-parser.add_argument('--optimizedistributions', 
+parser.add_argument('--sampledistributions', 
                     type=bool, 
                     default=False)
 
@@ -113,54 +113,18 @@ except AssertionError:
                      beta has been set to a value different from 1;\
                      beta will be ignored (Pitman-Yor is not implemented)''')
 
-try:
-    assert args.loadobjectfeatures != args.optimizeobjectfeatures
-    assert args.loadfeatureloadings != args.optimizefeatureloadings
-    assert args.loaddistributions != args.optimizedistributions
-except AssertionError:
-    warnings.warn('''parameters will be loaded but not pre-optimized;\
-                     they will be optimized instead of sampled\ 
-                     during model fit''')
 
 ##########
 ## fitting
 ##########
 
-print 'loading data'
-
 data = BatchData(data_fname=args.data)
 
-num_of_latfeats = args.featurenum if args.featurenum else 100
+model = Model(data=data, num_of_latfeats=args.featurenum, nonparametric=args.nonparametric,
+              alpha=args.alpha, beta=args.beta, gamma=args.gamma, lmbda=args.lmbda,
+              sample_D=args.sampledistributions, sample_B=args.samplefeatureloadings,
+              distributionproposalbandwidth=args.distributionproposalbandwidth,
+              featloadingsproposalbandwidth=args.featloadingsproposalbandwidth,
+              maxiter=args.maxiter, subiter=args.subiter)
 
-initial_D, initial_Z, initial_B = initialize_D_Z_B(data.get_data(),
-                                                   num_of_latfeats,
-                                                   maxiter=100,
-                                                   subiter=100)
-
-data_likelihood = PoissonGammaProductLikelihood(data=data,
-                                                gamma=args.gamma)
-
-print 'initializing D sampler'
-
-D_sampler = DSampler(D=initial_D,
-                     likelihood=data_likelihood, 
-                     proposal_bandwidth=args.distributionproposalbandwidth)
-
-beta_posterior = BetaPosterior(D_inference=D_sampler)
-
-print 'initializing Z sampler'
-
-Z_sampler = ZSampler(Z=initial_Z,
-                     likelihood=beta_posterior,
-                     alpha=args.alpha,
-                     nonparametric=args.nonparametric)
-
-print 'initializing B sampler'
-
-B_sampler = BSampler(B=initial_B,
-                     likelihood=beta_posterior,
-                     lmbda=args.lmbda,
-                     proposal_bandwidth=args.featloadingsproposalbandwidth)
-
-# model = FullGibbs(D_sampler, Z_sampler, B_sampler)
-# model.fit(args.iterations, args.burnin, args.thinning)
+model.fit(iterations=args.iterations, burnin=args.burnin, thinning=args.thinning)

@@ -210,12 +210,12 @@ class BetaPosterior(Prior, Likelihood):
         if self._Z != None and self._B != None:
             self._ZB = np.dot(self._Z, self._B)
             self._update_log_likelihood_values()
-
+            
     def compress_other_matrices(self, latfeats_gt_0):
-        self._B_inference.compress(latfeats_gt_0)
+        self._B_inference.compress(self._Z, latfeats_gt_0)
 
     def append_to_other_matrices(self, num_of_new_features):
-        self._B_inference.sample_new_features(num_of_new_features)
+        self._B_inference.append_new_features(num_of_new_features)
 
 
     def get_data(self):
@@ -707,6 +707,11 @@ class BSampler(Sampler):
     def compress(self, latfeat_gt_0):
         self._B = self._B[latfeat_gt_0]
 
+    def append_new_features(self, num_of_new_features):
+        shape = [num_of_new_features, self._num_of_obsfeats]
+        new_loadings = np.random.exponential(1., shape).astype(theano.config.floatX)
+        self._B = self._B.append(new_loadings, axis=0)
+
 
 
 ################
@@ -785,9 +790,7 @@ class DOptimizer(Optimizer):
     def get_prior_objective(self):
         return self._construct_prior_objective
 
-    def get_values(self):
-        self._D = self._tD.get_value()
-
+    def get_param(self):
         return self._D
     
     def optimize(self, maxiter=100, objective='MAP'):
@@ -799,6 +802,8 @@ class DOptimizer(Optimizer):
         for i in np.arange(maxiter):
             updater()
 
+        self._D = self._tD.get_value()
+            
 class ZBOptimizer(Optimizer):
 
     def __init__(self, D_optimizer, num_of_objects, num_of_obsfeats, num_of_latfeats, lmbda):
@@ -851,28 +856,40 @@ class ZBOptimizer(Optimizer):
 
         return update_Z, update_B
 
-    def reset_Z(self, Z):
+    def _reset_Z(self, Z):
         self._Z = Z
         self._tZ.set_value(self._Z)
 
-    def get_values(self):
-        self._Z, self._B = self._tZ.get_value(), self._tB.get_value()
+    def compress(self, Z, latfeats_gt_0):
+        self._reset_Z(Z)
+        self._B = self._B[latfeats_gt_0]
+
+    def append_new_features(self, num_of_new_features):
+        shape = [num_of_new_features, self._B.shape[1]]
+        new_loadings = np.random.exponential(1., shape).astype(theano.config.floatX)
+        self._B = self._B.append(new_loadings, axis=0)
+
+        self._tB.set_value(self._B)
         
-        return self._tZ.get_value(), self._tB.get_value()
-        
-    def optimize(self, maxiter=100, subiter=100):
+    def get_param(self):        
+        return self._Z, self._B
+    
+    def optimize(self, maxiter=100, subiter=100, update_Z=False):
         updater_Z, updater_B = self._MAP_updater_Z, self._MAP_updater_B  
 
         for i in np.arange(maxiter):
-            for j in np.arange(subiter):
-                updater_Z()
+            if update_Z:
+                for j in np.arange(subiter):
+                    updater_Z()
             for j in np.arange(subiter):
                 updater_B()
 
+        self._Z, self._B = self._tZ.get_value(), self._tB.get_value()
 
 class JointOptimizer(Optimizer):
 
-    def __init__(self, X, num_of_latfeats, gamma, lmbda):
+    def __init__(self, data, num_of_latfeats, gamma, lmbda):
+        X = data.get_data()
         num_of_objects, num_of_obsfeats = X.shape
 
         self._D_optimizer = DOptimizer(X, gamma)
@@ -882,74 +899,98 @@ class JointOptimizer(Optimizer):
                                          num_of_obsfeats,
                                          lmbda)
 
-    def get_values(self):
-        D = self._D_optimizer.get_values()
-        Z, B = self._ZB_optimizer.get_values()
+    def get_param(self):
+        D = self._D_optimizer.get_param()
+        Z, B = self._ZB_optimizer.get_param()
 
         return D, Z, B
-        
+    
+    def get_optimizers(self):
+        return self._D_optimizer, self._ZB_optimizer
+    
     def optimize(self, maxiter, subiter):
         ## initialize D with MLE estimate
         self._D_optimizer.optimize(maxiter=subiter, objective='MLE')
 
         for i in np.arange(maxiter):
-            self._ZB_optimizer(maxiter=1, subiter=subiter)
+            self._ZB_optimizer(maxiter=1, subiter=subiter, update_Z=True)
             self._D_optimizer.optimize(maxiter=subiter, objective='MAP')
 
 
 
-####################
-## fitting procedure
-####################
+#######################
+## fitting procedure ##
+#######################
 
 class Model(object):
 
-    @abc.abstractmethod
-    def fit(self, iterations, burnin, thinning):
-        return
-
-
-class FullGibbs(Model):
-
-    def __init__(self, data, num_of_latfeats):
-        
+    def __init__(self, data, num_of_latfeats, gamma, lmbda, sample_D, sample_B,
+                 distributionproposalbandwidth, featloadingsproposalbandwidth,
+                 maxiter, subiter, alpha, beta, lmbda, gamma, nonparametric):
         num_of_latfeats = num_of_latfeats if num_of_latfeats else 100
+        joint_optimizer = JointOptimizer(data=data,
+                                         num_of_latfeats=num_of_latfeats,
+                                         gamma=gamma,
+                                         lmbda=lmbda)
 
-        initial_D, initial_Z, initial_B = initialize_D_Z_B(data.get_data(),
-                                                           num_of_latfeats,
-                                                           maxiter=100,
-                                                           subiter=100)
+        joint_optimizer.optimize(maxiter=100, subiter=100)
+        
+        self._initialize_D_inference(data, joint_optimizer, sample_D, gamma,
+                                     maxiter, subiter, distributionproposalbandwidth)
 
-        data_likelihood = PoissonGammaProductLikelihood(data=data,
-                                                        gamma=args.gamma)
+        beta_posterior = BetaPosterior(D_inference=self._D_inference)
 
-        print 'initializing D sampler'
+        self._initialize_Z_inference(beta_posterior, joint_optimizer, alpha, beta, nonparametric)
+        self._initialize_B_inference(beta_posterior, joint_optimizer, sample_B, lmbda,
+                                     maxiter, subiter, featloadingsproposalbandwidth)
+        
+    def _initialize_D_inference(self, data, joint_optimizer, sample_D, gamma,
+                                maxiter, subiter, proposal_bandwidth):
 
-        D_sampler = DSampler(D=initial_D,
-                             likelihood=data_likelihood, 
-                             proposal_bandwidth=args.distributionproposalbandwidth)
+        initial_D, _, _ = joint_optimizer.get_param()
+        D_optimizer, _ = joint_optimizer.get_optimizers()
 
-        beta_posterior = BetaPosterior(D_inference=D_sampler)
+        if sample_D:
+            data_likelihood = PoissonGammaProductLikelihood(data=data,
+                                                            gamma=gamma)
 
-        print 'initializing Z sampler'
+            self._D_inference = DSampler(D=initial_D,
+                                         likelihood=data_likelihood, 
+                                         proposal_bandwidth=proposal_bandwidth)
 
-        Z_sampler = ZSampler(Z=initial_Z,
-                             likelihood=beta_posterior,
-                             alpha=args.alpha,
-                             nonparametric=args.nonparametric)
-
-        print 'initializing B sampler'
-
-        B_sampler = BSampler(B=initial_B,
-                             likelihood=beta_posterior,
-                             lmbda=args.lmbda,
-                             proposal_bandwidth=args.featloadingsproposalbandwidth)
+            self._fit_D = self._D_inference.sample
+        else:
+            self._D_inference = D_optimizer
+            self._fit_D = lambda: self._D_inference.optimize(maxiter=maxiter, subiter=subiter)
 
 
-        self._D_sampler = D_sampler
-        self._Z_sampler = Z_sampler
-        self._B_sampler = B_sampler
+    def _initialize_Z_inference(self, beta_posterior, initial_Z, alpha, beta, nonparametric):
+        _, initial_Z, _ = joint_optimizer.get_param()
+        
+        self._Z_inference = ZSampler(Z=initial_Z,
+                                     likelihood=likelihood,
+                                     alpha=alpha,
+                                     beta=beta,
+                                     nonparametric=nonparametric)
 
+        self._fit_Z = self._Z_inference.sample
+
+    def _initialize_B_inference(self, likelihood, joint_optimizer, sample_B, lmbda, proposal_bandwidth):
+        _, _, initial_B = joint_optimizer.get_param()
+        _, ZB_optimizer = joint_optimizer.get_optimizers()
+        
+        if sample_B:
+            self._B_inference = BSampler(B=initial_B,
+                                         likelihood=likelihood,
+                                         lmbda=lmbda,
+                                         proposal_bandwidth=proposal_bandwidth)
+            self._fit_B = self._B_inference.sample
+
+        else:
+            self._B_inference = ZB_optimizer
+            self._fit_B = lambda: self._B_inference.optimize(maxiter=maxiter, subiter=subiter)
+
+    
     def _initialize_samples(self, iterations, burnin, thinning):
         self._D_samples = np.empty((iterations-burnin)/thinning, 
                                    dtype=object)
@@ -958,21 +999,21 @@ class FullGibbs(Model):
         self._B_samples = np.empty((iterations-burnin)/thinning, 
                                    dtype=object)
 
-    def _sample(self):
-        self._D_sampler.sample()
-        self._Z_sampler.sample()
-        self._B_sampler.sample()
-
+    def _fit(self):
+        self._fit_D()
+        self._fit_Z()
+        self._fit_B()
+        
     def _save_samples(self, iterations, burnin, thinning):
-        self._D_samples[(itr-burnin)/thinning] = self._D_sampler.get_param()
-        self._Z_samples[(itr-burnin)/thinning] = self._Z_sampler.get_param()
-        self._B_samples[(itr-burnin)/thinning] = self._B_sampler.get_param()
+        self._D_samples[(itr-burnin)/thinning] = self._D_inference.get_param()
+        self._Z_samples[(itr-burnin)/thinning] = self._Z_inference.get_param()
+        self._B_samples[(itr-burnin)/thinning] = self._B_inference.get_param()
 
     def fit(self, iterations, burnin, thinning):
         self._initialize_samples(iterations, burnin, thinning)
 
         for itr in np.arange(iterations):
-            self._sample()
-
+            self._fit()
+            
             if itr >= burnin and not itr % thinning:
                 self._save_samples(iterations, burnin, thinning)
