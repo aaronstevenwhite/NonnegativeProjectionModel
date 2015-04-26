@@ -1,7 +1,6 @@
 import warnings, argparse
 
 from nonnegative_projection_model import *
-from nmf import initialize_D_Z_B
 
 ##################
 ## argument parser
@@ -24,7 +23,7 @@ parser.add_argument('--nonparametric',
                     default=False)
 parser.add_argument('--featurenum',
                     type=int, 
-                    default=0)
+                    default=10)
 parser.add_argument('--featureform',
                     type=str, 
                     choices=['discrete', 'continuous'], 
@@ -76,13 +75,13 @@ parser.add_argument('--sampledistributions',
 ## sampler parameters
 parser.add_argument('--iterations', 
                     type=int, 
-                    default=110000)
+                    default=110)
 parser.add_argument('--burnin', 
                     type=int, 
-                    default=10000)
+                    default=10)
 parser.add_argument('--thinning', 
                     type=int, 
-                    default=100)
+                    default=10)
 
 ## metropolis-hastings proposer parameters
 parser.add_argument('--distributionproposalbandwidth', 
@@ -91,6 +90,15 @@ parser.add_argument('--distributionproposalbandwidth',
 parser.add_argument('--featloadingsproposalbandwidth', 
                     type=float, 
                     default=1.)
+
+## optimizer parameters
+parser.add_argument('--maxiter', 
+                    type=int, 
+                    default=100)
+parser.add_argument('--subiter', 
+                    type=int, 
+                    default=100)
+
 
 ## parse arguments
 args = parser.parse_args()
