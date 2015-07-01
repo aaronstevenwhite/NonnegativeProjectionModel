@@ -1,4 +1,4 @@
-import abc, warnings, re
+import os, abc, warnings, re
 import numpy as np
 import scipy as sp
 import theano
@@ -6,94 +6,161 @@ import theano.tensor as T
 
 from scipy.optimize import minimize
 
-## TODO: change x == None to isinstance(x, type(None))
-
 ##########
 ## data ##
 ##########
 
 class Data(object):
+    '''
+    Base class containing methods for loading object-by-observed feature
+    count data from CSV files with object labels in the first column and 
+    observed feature labels in the first row
+    '''
+    
+    @classmethod
+    def _default_obj_filter(obj):
+        '''Filter predicate by whether it contains a copula or not'''
+        
+        return not re.match('^(be|become|are)\s', obj)
+    
+    def _load_data(self, fname, obj_filter=Data._default_obj_filter):
+        '''
+        Load data from CSV containing count data, extracting object labels 
+        from first column and observed feature labels from first row
 
-    def _load_X(self, fname, obj_filter=lambda obj: not re.match('^(be|become|are)\s', obj)):
+        fname (str): path to data
+        obj_filter (str -> bool): object filtering function
+        '''
+
+        ## load data from file
         data = np.loadtxt(fname, 
                           dtype=str, 
                           delimiter=',')
 
+        ## extract counts and labels for objects and observed features
         objects = data[1:,0]
         obsfeats = data[0,1:]
         X = data[1:,1:].astype(int)
 
+        ## vectorize the object filter function
         obj_filter_vectorized = np.vectorize(obj_filter)
 
+        ## filter objects using the vectorized object filter
         objects_filtered = obj_filter_vectorized(objects)
+
+        ## filter observed features by whether they non-zero counts
         obsfeats_filtered = X.sum(axis=0) > 0
 
-        self.objects = objects[objects_filtered]
-        self.obsfeats = obsfeats[obsfeats_filtered]
-        self._X = X[objects_filtered][:,obsfeats_filtered]
+        ## set data, object, and observed feature attributes
+        self._objects = objects[objects_filtered]
+        self._obsfeats = obsfeats[obsfeats_filtered]
+        self._data = X[objects_filtered][:,obsfeats_filtered]
+        
+    def get_objects(self):
+        '''Get object labels'''
+        return self._objects
 
-    def _initialize_ranges(self):
-        self._obj_range = range(self.objects.shape[0])
-        self._obsfeat_range = range(self.obsfeats.shape[0])
+    def get_obsfeats(self):
+        '''Get observed feature labels'''
+        return self._obsfeats
 
     def get_data(self):
-        return self._X
+        '''Get count data'''
+        return self._data
 
-    def get_obj_range(self):
-        return self._obj_range
+    def get_num_of_objects(self):
+        '''Get number of objects (after filtering)'''
+        return self.objects.shape[0]
 
-    def get_obsfeat_range(self):
-        return self._obsfeat_range
+    def get_num_of_obsfeats(self):
+        '''Get number of (non-zero) observed features'''
+        return self.obsfeats.shape[0]
 
-
+    
 class BatchData(Data):
+    '''
+    Wrapper for object-by-observed feature count data loaded from CSV;
+    IO function _load_data is inherited from class Data
+    '''
+    
+    def __init__(self, fname, obj_filter=Data._default_obj_filter):
+        '''
+        Load data from CSV containing count data, extracting object labels 
+        from first column and observed feature labels from first row
 
-    def __init__(self, data_fname):
-        self._load_X(data_fname)
+        fname (str): path to data
+        obj_filter (str -> bool): object filtering function
+        '''
+        
+        self._load_data(fname, obj_filter)
 
         self._initialize_obj_counts()
-        self._initialize_ranges()
 
     def _initialize_obj_counts(self):
-        self._X_obj_count = self._X.sum(axis=1)
+        '''Count total number of times each object was seen'''
+        
+        self._data_obj_count = self._data.sum(axis=1)
 
     def get_obj_counts(self):
-        return self._X_obj_count
+        '''Get total number of times each object was seen'''
+        
+        return self._data_obj_count
 
 class IncrementalData(Data):
+    '''
+    Wrapper for object-by-observed feature count data loaded from CSV that 
+    is iterable; incorporates a sampler for object-observed feature iterates
+    IO function _load_data is inherited from class Data
+    '''
+    
+    def __init__(self, fname, obj_filter=Data._default_obj_filter):
+        '''
+        Load data from CSV containing count data, extracting object labels 
+        from first column and observed feature labels from first row
 
-    def __init__(self, data_fname, seed=0):
-        np.random.seed(seed)
+        fname (str): path to data
+        obj_filter (str -> bool): object filtering function
+        '''
 
-        self._load_X(data_fname)
+        self._load_data(fname)
 
         self._initialize_obj_counts()
-        self._initialize_ranges()
-
-        self._seen = np.zeros(self._X.shape)
-        self._initialize_pair_probs()
-
+        
     def __iter__(self):
         return self
 
     def _initialize_obj_counts(self):
-        self._X_obj_count = np.zeros(self._X.shape[0])
-        self._unseen = self._X.astype(float)
+        '''
+        Initialize variables for total number of times object seen, 
+        number of times object-observed feature pair seen, and number 
+        of times object-observed feature pair could be seen in the future
+        '''
 
-    def _update_pair_probs(self):
-        self._pair_probs = (self._unseen / self._unseen.sum()).flatten()
+        self._data_obj_count = np.zeros(self._data.shape[0])
+        self._unseen = self._data.astype(float)
+        self._seen = np.zeros(self._data.shape)
 
-    def _sample_pair(self):
-        pair_index = np.random.choice(a=self._pairs_probs.shape[0], 
-                                      p=self._pair_probs)
+        self._update_joint_prob()
+        
+    def _update_joint_prob(self):
+        '''Update probability of seeing each object-observed feature pair'''        
+        
+        joint_prob = self._unseen / self._unseen.sum()
+        self._joint_prob = joint_prob.flatten()
+        
+    def _sample_index(self):
+        '''Sample a single object-observed feature pair'''        
+        
+        pair_index = np.random.choice(a=self._joint_prob.shape[0], 
+                                      p=self._joint_prob)
 
-        obj_index = pair_index / self._X.shape[1]
-        obsfeat_index = pair_index / self._X.shape[0]
+        obj_index = pair_index / self._data.shape[1]
+        obsfeat_index = pair_index / self._data.shape[0]
         
         self._unseen[obj_index, obsfeat_index] -= 1
         self._seen[obj_index, obsfeat_index] += 1
 
-        self._update_pair_probs()
+        self._update_joint_prob()
 
         return obj_index, obsfeat_index
 
@@ -103,8 +170,8 @@ class IncrementalData(Data):
         except AssertionError:
             raise StopIteration
 
-        datum = np.zeros(self._X.shape)
-        datum[self._sample_pair()] += 1
+        datum = np.zeros(self._data.shape)
+        datum[self._sample_index()] += 1
 
         return datum
 
@@ -140,13 +207,13 @@ class PoissonGammaProductLikelihood(Likelihood):
         self._data = data
 
         if isinstance(data, BatchData):
-            self._X = data.get_data()
-            self._X_obj_count = data.get_obj_counts()
+            self._data = data.get_data()
+            self._data_obj_count = data.get_obj_counts()
             self._obj_range = data.get_obj_range()
             self._obsfeat_range = data.get_obsfeat_range()
 
         elif isinstance(data, IncrementalData):
-            self._X_gen = data
+            self._data_gen = data
 
     def link_prior(self, D_inference):
         self._D = D_inference.get_param()
@@ -155,37 +222,37 @@ class PoissonGammaProductLikelihood(Likelihood):
         return self._data.get_data()
 
     def _construct_indices(self, obj, obsfeat):
-        obj = self._obj_range if obj == None else obj
-        obsfeat = self._obsfeat_range if obsfeat == None else obsfeat
+        obj = self._obj_range if obj is None else obj
+        obsfeat = self._obsfeat_range if obsfeat is None else obsfeat
 
         return obj, obsfeat
 
     def _compute_ll_d_new(self, d_new, obj, obsfeat):
-        log_numer = self._X[obj,obsfeat] * np.log(d_new)
+        log_numer = self._data[obj,obsfeat] * np.log(d_new)
 
         d_obj = np.insert(np.delete(self._D[obj], 
                                     obsfeat), 
                           obsfeat, 
                           d_new)
 
-        log_denom_X = 1 + self._X_obj_count[obj]
+        log_denom_data = 1 + self._data_obj_count[obj]
         log_denom_D = np.log(self.gamma + d_obj.sum())
-        log_denom = log_denom_X * log_denom_D
+        log_denom = log_denom_data * log_denom_D
 
         return log_numer - log_denom
 
     def _compute_ll_D(self):
-        log_numer = np.sum(self._X * np.log(self._D), axis=1)
+        log_numer = np.sum(self._data * np.log(self._D), axis=1)
 
-        log_denom_X = 1 + self._X_obj_count[:,None]
+        log_denom_data = 1 + self._data_obj_count[:,None]
         log_denom_D = np.log(self.gamma + self._D.sum(axis=1))
-        log_denom = log_denom_X * log_denom_D
+        log_denom = log_denom_data * log_denom_D
 
         return np.sum(log_numer - log_denom)
 
 
     def compute_log_likelihood(self, d_new=None, obj=None, obsfeat=None):
-        if d_new == None:
+        if d_new is None:
             return self._compute_ll_D()
         else:
             return self._compute_ll_d_new(d_new, obj, obsfeat)
@@ -381,7 +448,7 @@ class DSampler(Sampler):
                                  high=self._D[obj,obsfeat]+window_size)
 
     def _log_proposal_prob(self, obj, obsfeat, proposal=None):
-        if proposal == None:
+        if proposal is None:
             return self._log_proposal_prob_values[obj, obsfeat]
 
         else:
@@ -450,10 +517,10 @@ class ZSampler(Sampler):
         Initialize the verb-by-latent binary feature sampler
 
         Args:
+          Z (numpy.ndarray): object by latent feature association matrix
           likelihood (Likelihood): computes p(D|B,Z) and implements interfaces in ABC Likelihood
-          alpha (float): positive real number parameterizing Beta(alpha, 1) or IBP(alpha)
-          num_of_latfeats (int): number of latent binary features; 
-                                 if 0, the sampler is nonparametric (IBP)
+          alpha, beta (float): positive real number parameterizing Beta(alpha, beta) or IBP(alpha)
+          nonparametric (bool): whether the prior should be considered nonparametric
         """
 
         self.alpha = alpha
@@ -464,8 +531,9 @@ class ZSampler(Sampler):
         self._initialize_Z(Z, likelihood)
 
     def _initialize_Z(self, Z, likelihood):
-        self._Z = np.where(Z > .5, 1, 0).astype(theano.config.floatX)
-
+        self._Z = Z
+        #self._Z = np.ones(Z.shape)
+        
         self._num_of_objects, self._num_of_latfeats = Z.shape
 
         self._obj_range = range(self._num_of_objects)
@@ -535,15 +603,33 @@ class ZSampler(Sampler):
     def get_param_Z(self):
         return self._Z
     
+    def compute_log_prior(self):
+        V = self._num_of_objects
+
+        if self.nonparametric:
+            alpha = 0.
+            beta = 1.
+        else:
+            alpha = self.alpha
+            beta = self.beta
+
+        log_numer1 = sp.special.gammaln(self.alpha+self._feature_counts)
+        log_numer2 = sp.special.gammaln(self.beta+V-self._feature_counts)
+        log_denom = sp.special.gammaln(self.alpha+self.beta+V)
+
+        return np.sum(log_numer1 + log_numer2 - log_denom)
+
     def _sample(self, obj, latfeat):
         z_new = np.abs(self._Z[obj, latfeat]-1)
         
         logpost_off, logpost_on = self._compute_log_posterior(z_new, obj, latfeat)
-
+        
         logpost_on = logpost_on if logpost_on != -np.inf else -1e20
         logpost_off = logpost_off if logpost_off != -np.inf else -1e20
         
         prob = np.exp(logpost_on - np.logaddexp(logpost_on, logpost_off))
+
+        #print obj, latfeat, logpost_off, logpost_on, prob
         
         return sp.stats.bernoulli.rvs(prob)
 
@@ -621,7 +707,7 @@ class BSampler(Sampler):
                                  high=self._B[latfeat,obsfeat]+window_size)
 
     def _log_proposal_prob(self, latfeat, obsfeat, proposal=None):
-        if proposal == None:
+        if proposal is None:
             return self._log_proposal_prob_values[latfeat, obsfeat]
 
         else:
@@ -695,10 +781,10 @@ class BSampler(Sampler):
 
 class Optimizer(object):
 
-    def __init__(self, data, learning_rate=0.1):
+    def __init__(self, data, learning_rate=0.01):
         self._data = data.get_data().astype(theano.config.floatX)
         self._learning_rate = learning_rate
-        self._num_of_rows, self._num_of_columns = self._X.shape
+        self._num_of_rows, self._num_of_columns = self._data.shape
     
     @abc.abstractmethod
     def optimize(self):
@@ -711,11 +797,15 @@ class Optimizer(object):
 
 class DOptimizer(Optimizer):
 
-    def __init__(self, X, gamma, learning_rate):
-        self._X = X.astype(theano.config.floatX)
-        self._D = np.random.beta(1., 1., X.shape).astype(theano.config.floatX)
+    def __init__(self, X, gamma, learning_rate, D=None):
+        self._data = X.astype(theano.config.floatX)
+
+        if not isinstance(D, type(None)):
+            self._D = D
+        else:
+            self._D = np.random.beta(1., 1., X.shape).astype(theano.config.floatX)
         
-        self._tX = theano.shared(self._X, name='X')
+        self._tX = theano.shared(self._data, name='X')
         self._tD = theano.shared(self._D, name='D')
         
         self._likelihood_objective = self._construct_likelihood_objective(gamma)
@@ -727,18 +817,32 @@ class DOptimizer(Optimizer):
     def _construct_likelihood_objective(self, gamma):
         tX, tD = self._tX, self._tD
 
+        # if gamma:
+        #     tgamma = theano.shared(theano.config.floatX(gamma))
+        # else:
+        #     tgamma = theano.shared(theano.config.floatX(1.))
+            
         gamma_poisson_numer = T.sum(tX * T.log(tD), axis=1)
         gamma_poisson_denom = (1 + T.sum(tX, axis=1))*T.log(gamma+T.sum(tD, axis=1))
+        
+        likelihood_objective = T.sum(gamma_poisson_numer - gamma_poisson_denom)
 
-        return T.sum(gamma_poisson_numer - gamma_poisson_denom)
+        self.compute_log_likelihood = theano.function([], likelihood_objective)
+        
+        return likelihood_objective
 
-    def _construct_prior_objective(self, tZB):
+    def _construct_prior_objective(self):
         tD = self._tD
+        tZB = self._tZB + 1e-20
 
         return T.sum(T.log(tZB) + (tZB-1.)*T.log(tD))
 
     def _construct_posterior_objective(self):
-        return self._prior_objective + self._likelihood_objective
+        posterior_objective = self._prior_objective + self._likelihood_objective
+
+        self.compute_log_posterior = theano.function([], posterior_objective)
+
+        return posterior_objective
 
     def _construct_updater(self, objective, learning_rate):
         tD = self._tD
@@ -752,10 +856,12 @@ class DOptimizer(Optimizer):
                                updates={tD:tD+step_size_D*gradient},
                                name='update_D')
 
-    def link_prior(self, prior, learning_rate=0.1):
+    def link_prior(self, prior, learning_rate=0.01):
         self._tZB = prior.get_param_shared()
-        self._prior_objective = self._construct_prior_objective(self._tZB)
+
+        self._prior_objective = self._construct_prior_objective()
         self._posterior_objective = self._construct_posterior_objective()
+
         self._MAP_updater = self._construct_updater(self._posterior_objective, learning_rate)
 
     def get_prior_objective(self):
@@ -774,17 +880,34 @@ class DOptimizer(Optimizer):
             updater()
 
         self._D = self._tD.get_value()
-            
+
+    def write(self, outfile):
+        np.savetxt(outfile, 
+                   self._D,
+                   #header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   #comments='',
+                   fmt="%s")
+
+        
 class ZBOptimizer(Optimizer):
 
-    def __init__(self, D_optimizer, num_of_latfeats, lmbda, learning_rate):
+    def __init__(self, D_optimizer, num_of_latfeats, lmbda, learning_rate, Z=None, B=None):
         num_of_objects, num_of_obsfeats = D_optimizer.get_param().shape
         
         shape_Z = [num_of_objects, num_of_latfeats]
         shape_B = [num_of_latfeats, num_of_obsfeats]
 
-        self._Z = np.random.beta(1., 1., shape_Z).astype(theano.config.floatX)
-        self._B = np.random.exponential(1., shape_B).astype(theano.config.floatX)
+        if not isinstance(Z, type(None)):
+            self._Z = Z
+        else:
+            self._Z = np.random.exponential(1., shape_Z).astype(theano.config.floatX)
+
+        if not isinstance(B, type(None)):
+            self._B = B
+        else:
+            self._B = np.random.exponential(1., shape_B).astype(theano.config.floatX)
+
         self._ZB = np.dot(self._Z, self._B)
         
         self._tZ = theano.shared(self._Z, name='Z')
@@ -795,10 +918,26 @@ class ZBOptimizer(Optimizer):
         
         self._posterior_objective = self._construct_posterior_objective(D_optimizer, lmbda)
         self._MAP_updater_Z, self._MAP_updater_B = self._construct_updater(self._posterior_objective, learning_rate)
+
         
     def _construct_prior_objective(self, lmbda):
-        return T.sum(-lmbda*self._tB)
+        prior_Z = T.sum(-lmbda*10*self._tZ)
+        prior_B = T.sum(-lmbda*self._tB)
+
+        self._compute_log_prior_Z = theano.function([], prior_Z)
+        self._compute_log_prior_B = theano.function([], prior_B)
+        self._compute_log_prior_ZB = theano.function([], prior_Z + prior_B)
+
+        return prior_Z + prior_B
         
+    def compute_log_prior(self, param='B'):
+        if param == 'Z':
+            return self._compute_log_prior_Z()
+        elif param == 'B':
+            return self._compute_log_prior_B()
+        else:
+            self._compute_log_prior_ZB()
+
     def _construct_likelihood_objective(self, D_optimizer):
         return D_optimizer.get_prior_objective()
 
@@ -816,7 +955,7 @@ class ZBOptimizer(Optimizer):
         gradient_Z = T.tanh(T.grad(objective, tZ))
         gradient_B = T.tanh(T.grad(objective, tB))
 
-        step_size_Z = learning_rate * (T.minimum(self._tZ, 1.-self._tZ) - 1e-20)
+        step_size_Z = learning_rate * T.minimum(tZ, T.abs_(T.log(tZ))+1.)
         step_size_B = learning_rate * T.minimum(tB, T.abs_(T.log(tB))+1.)
 
         update_Z = theano.function(inputs=[],
@@ -833,10 +972,14 @@ class ZBOptimizer(Optimizer):
     def set_Z(self, Z):
         self._Z = Z
         self._reset_shared()
-    
+
+    def set_B(self, B):
+        self._B = B
+        self._reset_shared()
+
     def _reset_shared(self):
         Z_noisy = np.where(self._Z == 0, 1e-20, 1.).astype(theano.config.floatX)
-        
+            
         self._tZ.set_value(Z_noisy)
         self._tB.set_value(self._B)
         
@@ -876,38 +1019,92 @@ class ZBOptimizer(Optimizer):
 
         if update_Z:
             self._Z = self._tZ.get_value()
-                
+            
         self._B = self._tB.get_value()
         self._ZB = np.dot(self._Z, self._B)
         
+    def prepare_ZB(self):
+        ## calculate max by feature
+        Z_max = self._Z.max(axis=0)
+        
+        ## shift weights on B relative to largest weight
+        ## for each feature    
+        self._B = (self._B * Z_max[:,None]).astype(theano.config.floatX)
+
+        ## normalize Z so max is 1 for each feature
+        ## and threshold at .01 (should sluff off extra features when sampling started)
+        Z_norm = self._Z / Z_max[None,:]
+        self._Z = np.where(Z_norm>np.median(Z_norm, axis=0)[None,:], 1., 0.)
+
+        ## reset the shared variables to their new values
+        self._reset_shared()
+        
+        return self._Z
+        
 class JointOptimizer(Optimizer):
 
-    def __init__(self, data, num_of_latfeats, gamma, lmbda, learning_rate=0.1):
+    def __init__(self, data, num_of_latfeats, gamma, lmbda, learning_rate=0.01,
+                 D=None, Z=None, B=None, pretrain_D=False, pretrain_ZB=True):
         X = data.get_data()
         num_of_objects, num_of_obsfeats = X.shape
 
-        self._D_optimizer = DOptimizer(X, gamma, learning_rate)
+        self._pretrain_D = pretrain_D
+        
+        self._D_optimizer = DOptimizer(X, gamma, learning_rate, D=D)
         self._ZB_optimizer = ZBOptimizer(self._D_optimizer,
                                          num_of_latfeats,
                                          lmbda,
-                                         learning_rate)
+                                         learning_rate,
+                                         Z=Z, B=B)
 
     def get_param(self):
         D = self._D_optimizer.get_param()
         Z, B = self._ZB_optimizer.get_param()
 
-        return D, Z, B
+        return np.copy(D), np.copy(Z), np.copy(B)
+
+    def prepare_Z(self):
+        return self._ZB_optimizer.prepare_ZB()
     
     def get_optimizers(self):
         return self._D_optimizer, self._ZB_optimizer
     
     def optimize(self, maxiter, subiter):
         ## initialize D with MLE estimate
-        self._D_optimizer.optimize(maxiter=subiter, objective_type='MLE')
+        if self._pretrain_D:
+            self._D_optimizer.optimize(maxiter=maxiter, objective_type='MLE')
+            print 'MLE log-likelihood:', self._D_optimizer.compute_log_likelihood()
+        
+        self._ZB_optimizer.optimize(maxiter=maxiter, subiter=subiter, update_Z=True)
+        
+        # for i in range(maxiter):
+        #     print i, self._D_optimizer.compute_log_likelihood(), self._D_optimizer.compute_log_likelihood()+self._ZB_optimizer.compute_log_prior('Z') +self._ZB_optimizer.compute_log_prior('B')
+        #     self._ZB_optimizer.optimize(maxiter=1, subiter=subiter, update_Z=True)
+        #     self._D_optimizer.optimize(maxiter=1, objective_type='MAP')
+        
+    def write(self, outdir):
+        D, Z, B = self.get_param()
+        
+        np.savetxt(os.path.join(outdir, 'D_MLE.csv'), 
+                   D,
+                   #header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   #comments='',
+                   fmt="%s")
 
-        for i in np.arange(maxiter):
-            self._ZB_optimizer.optimize(maxiter=1, subiter=subiter, update_Z=True)
-            self._D_optimizer.optimize(maxiter=subiter, objective_type='MAP')
+        np.savetxt(os.path.join(outdir, 'B_MAP.csv'), 
+                   B,
+                   #header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   #comments='',
+                   fmt="%s")
+
+        np.savetxt(os.path.join(outdir, 'Z_MAP.csv'), 
+                   Z,
+                   #header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   #comments='',
+                   fmt="%s")
 
 
 
@@ -919,30 +1116,41 @@ class Model(object):
 
     def __init__(self, data, num_of_latfeats, gamma, lmbda, alpha, beta, nonparametric,
                  sample_D, sample_B, distributionproposalbandwidth, featloadingsproposalbandwidth,
-                 maxiter, subiter):
-        num_of_latfeats = num_of_latfeats if num_of_latfeats else 10
+                 initializationmaxiter, initializationsubiter, samplermaxiter, samplersubiter,
+                 D=None, Z=None, B=None):
+
+        self.data = data
+
+        self.num_of_latfeats = num_of_latfeats if num_of_latfeats else 10
+        
         joint_optimizer = JointOptimizer(data=data,
                                          num_of_latfeats=num_of_latfeats,
                                          gamma=gamma,
-                                         lmbda=lmbda)
+                                         lmbda=lmbda,
+                                         D=D, Z=Z, B=B, pretrain_D=isinstance(D, type(None)))
 
-        joint_optimizer.optimize(maxiter=maxiter, subiter=subiter)
+        joint_optimizer.optimize(maxiter=initializationmaxiter, subiter=initializationsubiter)
+
+        self._joint_optimizer = joint_optimizer
         
         self._initialize_D_inference(data, joint_optimizer, sample_D, gamma,
-                                     maxiter, subiter, distributionproposalbandwidth)
+                                     samplermaxiter, distributionproposalbandwidth)
 
         self._beta_posterior = BetaPosterior(D_inference=self._D_inference)
-
+        
         self._initialize_Z_inference(joint_optimizer, alpha, beta, nonparametric)
         self._initialize_B_inference(joint_optimizer, sample_B, lmbda,
-                                     maxiter, subiter, featloadingsproposalbandwidth)
+                                     samplermaxiter, samplersubiter,
+                                     featloadingsproposalbandwidth)
         
     def _initialize_D_inference(self, data, joint_optimizer, sample_D, gamma,
-                                maxiter, subiter, proposal_bandwidth):
+                                maxiter, proposal_bandwidth):
 
         initial_D, _, _ = joint_optimizer.get_param()
         D_optimizer, _ = joint_optimizer.get_optimizers()
 
+        self._initial_D = initial_D
+        
         if sample_D:
             data_likelihood = PoissonGammaProductLikelihood(data=data,
                                                             gamma=gamma)
@@ -958,7 +1166,8 @@ class Model(object):
 
 
     def _initialize_Z_inference(self, joint_optimizer, alpha, beta, nonparametric):
-        _, initial_Z, _ = joint_optimizer.get_param()
+        _, self._initial_Z, _ = joint_optimizer.get_param()
+        initial_Z = joint_optimizer.prepare_Z()
         
         self._Z_inference = ZSampler(Z=initial_Z,
                                      likelihood=self._beta_posterior,
@@ -971,6 +1180,8 @@ class Model(object):
     def _initialize_B_inference(self, joint_optimizer, sample_B, lmbda, maxiter, subiter, proposal_bandwidth):
         _, _, initial_B = joint_optimizer.get_param()
         _, ZB_optimizer = joint_optimizer.get_optimizers()
+
+        self._initial_B = initial_B
         
         if sample_B:
             self._B_inference = BSampler(B=initial_B,
@@ -1007,12 +1218,56 @@ class Model(object):
         self._Z_samples[(itr-burnin)/thinning] = self._Z_inference.get_param()
         self._B_samples[(itr-burnin)/thinning] = self._B_inference.get_param()
 
+
+    def compute_log_likelihood(self):
+         return float(self._D_inference.compute_log_likelihood())
+
+    def compute_log_posterior(self):
+        posterior_D = self._D_inference.compute_log_posterior()
+        prior_Z = self._Z_inference.compute_log_prior()
+        prior_B = self._B_inference.compute_log_prior()
+
+        return posterior_D + prior_Z + prior_B
+    
     def fit(self, iterations, burnin, thinning):
         self._initialize_samples(iterations, burnin, thinning)
 
+        for preitr in np.arange(burnin):
+            print 'Z', preitr
+            self._fit_Z()
+
+        self._fit_B()
+        self._fit_D()
+        
         for itr in np.arange(iterations):
             print 'iteration', itr
+            print 'likelihood:', self.compute_log_likelihood()
+            print 'posterior:', self.compute_log_posterior(), '\n'
+
             self._fit()
-            
+
             if itr >= burnin and not itr % thinning:
-                self._save_samples(iterations, burnin, thinning)
+                self._save_samples(itr, burnin, thinning)
+
+    def write(self, outdir):
+
+        np.savetxt(os.path.join(outdir, 'D'+str(self.num_of_latfeats)+'.csv'), 
+                   self._D_samples[-1],
+                   header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   comments='',
+                   fmt="%s")
+        
+        np.savetxt(os.path.join(outdir, 'B'+str(self.num_of_latfeats)+'.csv'), 
+                   self._B_samples[-1][1],
+                   header=';'.join(self.data.obsfeats),
+                   delimiter=';',
+                   comments='',
+                   fmt="%s")
+
+        np.savetxt(os.path.join(outdir, 'Z'+str(self.num_of_latfeats)+'.csv'), 
+                   self._Z_samples[-1],
+                   delimiter=';',
+                   comments='',
+                   fmt="%s")
+
