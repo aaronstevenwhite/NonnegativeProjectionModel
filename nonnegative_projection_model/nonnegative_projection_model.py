@@ -4,271 +4,132 @@ import scipy as sp
 import theano
 import theano.tensor as T
 
-from scipy.optimize import minimize
-
-##########
-## data ##
-##########
-
-class Data(object):
-    '''
-    Base class containing methods for loading object-by-observed feature
-    count data from CSV files with object labels in the first column and 
-    observed feature labels in the first row
-    '''
-    
-    @classmethod
-    def _default_obj_filter(obj):
-        '''Filter predicate by whether it contains a copula or not'''
-        
-        return not re.match('^(be|become|are)\s', obj)
-    
-    def _load_data(self, fname, obj_filter=Data._default_obj_filter):
-        '''
-        Load data from CSV containing count data, extracting object labels 
-        from first column and observed feature labels from first row
-
-        fname (str): path to data
-        obj_filter (str -> bool): object filtering function
-        '''
-
-        ## load data from file
-        data = np.loadtxt(fname, 
-                          dtype=str, 
-                          delimiter=',')
-
-        ## extract counts and labels for objects and observed features
-        objects = data[1:,0]
-        obsfeats = data[0,1:]
-        X = data[1:,1:].astype(int)
-
-        ## vectorize the object filter function
-        obj_filter_vectorized = np.vectorize(obj_filter)
-
-        ## filter objects using the vectorized object filter
-        objects_filtered = obj_filter_vectorized(objects)
-
-        ## filter observed features by whether they non-zero counts
-        obsfeats_filtered = X.sum(axis=0) > 0
-
-        ## set data, object, and observed feature attributes
-        self._objects = objects[objects_filtered]
-        self._obsfeats = obsfeats[obsfeats_filtered]
-        self._data = X[objects_filtered][:,obsfeats_filtered]
-        
-    def get_objects(self):
-        '''Get object labels'''
-        return self._objects
-
-    def get_obsfeats(self):
-        '''Get observed feature labels'''
-        return self._obsfeats
-
-    def get_data(self):
-        '''Get count data'''
-        return self._data
-
-    def get_num_of_objects(self):
-        '''Get number of objects (after filtering)'''
-        return self.objects.shape[0]
-
-    def get_num_of_obsfeats(self):
-        '''Get number of (non-zero) observed features'''
-        return self.obsfeats.shape[0]
-
-    
-class BatchData(Data):
-    '''
-    Wrapper for object-by-observed feature count data loaded from CSV;
-    IO function _load_data is inherited from class Data
-    '''
-    
-    def __init__(self, fname, obj_filter=Data._default_obj_filter):
-        '''
-        Load data from CSV containing count data, extracting object labels 
-        from first column and observed feature labels from first row
-
-        fname (str): path to data
-        obj_filter (str -> bool): object filtering function
-        '''
-        
-        self._load_data(fname, obj_filter)
-
-        self._initialize_obj_counts()
-
-    def _initialize_obj_counts(self):
-        '''Count total number of times each object was seen'''
-        
-        self._data_obj_count = self._data.sum(axis=1)
-
-    def get_obj_counts(self):
-        '''Get total number of times each object was seen'''
-        
-        return self._data_obj_count
-
-class IncrementalData(Data):
-    '''
-    Wrapper for object-by-observed feature count data loaded from CSV that 
-    is iterable; incorporates a sampler for object-observed feature iterates
-    IO function _load_data is inherited from class Data
-    '''
-    
-    def __init__(self, fname, obj_filter=Data._default_obj_filter):
-        '''
-        Load data from CSV containing count data, extracting object labels 
-        from first column and observed feature labels from first row
-
-        fname (str): path to data
-        obj_filter (str -> bool): object filtering function
-        '''
-
-        self._load_data(fname)
-
-        self._initialize_obj_counts()
-        
-    def __iter__(self):
-        return self
-
-    def _initialize_obj_counts(self):
-        '''
-        Initialize variables for total number of times object seen, 
-        number of times object-observed feature pair seen, and number 
-        of times object-observed feature pair could be seen in the future
-        '''
-
-        self._data_obj_count = np.zeros(self._data.shape[0])
-        self._unseen = self._data.astype(float)
-        self._seen = np.zeros(self._data.shape)
-
-        self._update_joint_prob()
-        
-    def _update_joint_prob(self):
-        '''Update probability of seeing each object-observed feature pair'''        
-        
-        joint_prob = self._unseen / self._unseen.sum()
-        self._joint_prob = joint_prob.flatten()
-        
-    def _sample_index(self):
-        '''Sample a single object-observed feature pair'''        
-        
-        pair_index = np.random.choice(a=self._joint_prob.shape[0], 
-                                      p=self._joint_prob)
-
-        obj_index = pair_index / self._data.shape[1]
-        obsfeat_index = pair_index / self._data.shape[0]
-        
-        self._unseen[obj_index, obsfeat_index] -= 1
-        self._seen[obj_index, obsfeat_index] += 1
-
-        self._update_joint_prob()
-
-        return obj_index, obsfeat_index
-
-    def next(self):
-        try:
-            assert self._unseen.sum() > 0
-        except AssertionError:
-            raise StopIteration
-
-        datum = np.zeros(self._data.shape)
-        datum[self._sample_index()] += 1
-
-        return datum
-
-
-##############
-## likelihoods
-##############
+from data import *
 
 class Likelihood(object):
+    '''
+    Abstract base class for classes that compute the likelihood
+    of some parameter(s) given some data
+    '''
+    
+    __metaclass__ = abc.ABCMeta
 
     @abc.abstractmethod
     def compute_log_likelihood(self, parameter, **kwargs):
-        return
-
-    @abc.abstractmethod
-    def get_data(self):
+        '''Compute the log-likelihood of parameter given data'''
+        
         return
 
 class Prior(object):
-
+    '''
+    Abstract base class for classes that compute the prior 
+    probability of some parameter(s) given some hyperparameters
+    '''
+    
+    __metaclass__ = abc.ABCMeta
+    
     @abc.abstractmethod
     def compute_log_prior(self, parameter, **kwargs):
+        '''Compute the prior probability of parameter given data'''
+
         return
 
 class PoissonGammaProductLikelihood(Likelihood):
-
+    '''
+    Likelihood of D: p(X|D; gamma) = int dg p(X|D, g)p(g; gamma)
+    '''
+    
     def __init__(self, data, gamma=1.):
+        '''
+        Initialize likelihood of D given subclass of Data and
+        Gamma distribution shape parameter gamma (aka alpha or k)
+
+        data (subclass of Data): count data
+        gamma (float): Gamma distribution shape parameter
+        '''
+        
         self.gamma = gamma
-
-        self._initialize_data(data)
-
-    def _initialize_data(self, data):
         self._data = data
 
-        if isinstance(data, BatchData):
-            self._data = data.get_data()
-            self._data_obj_count = data.get_obj_counts()
-            self._obj_range = data.get_obj_range()
-            self._obsfeat_range = data.get_obsfeat_range()
+    @property
+    def data(self):
+        return self._data.data
 
-        elif isinstance(data, IncrementalData):
-            self._data_gen = data
+    @property
+    def obj_counts(self):
+        return self._data.obj_counts
+         
+    def _compute_ll_d_new(self, D, d_new, obj, obsfeat):
+        '''
+        Compute the log likelihood that the value of D[obj,obsfeat]
+        is d_new
 
-    def link_prior(self, D_inference):
-        self._D = D_inference.get_param()
+        D (np.array): unit-valued object-by-observed feature matrix
+        d_new (float): proposed unit value of D[obj,obsfeat]
+        obj (int): row index
+        obsfeat (int): column index
+        '''
+        
+        log_numer = self.data[obj,obsfeat] * np.log(d_new)
 
-    def get_data(self):
-        return self._data.get_data()
-
-    def _construct_indices(self, obj, obsfeat):
-        obj = self._obj_range if obj is None else obj
-        obsfeat = self._obsfeat_range if obsfeat is None else obsfeat
-
-        return obj, obsfeat
-
-    def _compute_ll_d_new(self, d_new, obj, obsfeat):
-        log_numer = self._data[obj,obsfeat] * np.log(d_new)
-
-        d_obj = np.insert(np.delete(self._D[obj], 
-                                    obsfeat), 
+        d_obj = np.insert(np.delete(D[obj], obsfeat), 
                           obsfeat, 
                           d_new)
 
-        log_denom_data = 1 + self._data_obj_count[obj]
+        log_denom_data = 1 + self.obj_counts[obj]
         log_denom_D = np.log(self.gamma + d_obj.sum())
         log_denom = log_denom_data * log_denom_D
 
         return log_numer - log_denom
 
-    def _compute_ll_D(self):
-        log_numer = np.sum(self._data * np.log(self._D), axis=1)
+    def _compute_ll_D(self, D):
+        '''
+        Compute the total log likelihood of D
 
-        log_denom_data = 1 + self._data_obj_count[:,None]
-        log_denom_D = np.log(self.gamma + self._D.sum(axis=1))
+        D (np.array): unit-valued object-by-observed feature matrix
+        '''
+        
+        log_numer = np.sum(self.data * np.log(D), axis=1)
+
+        log_denom_data = 1 + self.obj_count[:,None]
+        log_denom_D = np.log(self.gamma + D.sum(axis=1))
         log_denom = log_denom_data * log_denom_D
 
         return np.sum(log_numer - log_denom)
 
+    def compute_log_likelihood(self, D=None, d_new=None, obj=None, obsfeat=None):
+        '''
+        Compute either (i) the total log likelihood of D or (ii) the
+        log likelihood that the value of D[obj,obsfeat] is d_new
+        to compute the total LL of D, only pass this method D
+        to the LL that d_new = D[obj,obsfeat], pass this method all parameters
 
-    def compute_log_likelihood(self, d_new=None, obj=None, obsfeat=None):
-        if d_new is None:
-            return self._compute_ll_D()
+        D (np.array): unit-valued object-by-observed feature matrix
+        d_new (float): proposed unit value of D[obj,obsfeat]
+        obj (int): row index
+        obsfeat (int): column index
+        '''
+
+        if d_new is not None:
+            return self._compute_ll_d_new(D, d_new, obj, obsfeat)
         else:
-            return self._compute_ll_d_new(d_new, obj, obsfeat)
+            return self._compute_ll_D(D)
 
 
 class BetaPosterior(Prior, Likelihood):
 
     def __init__(self, D_inference):
         self._D_inference = D_inference
-        self._D = D_inference.get_param()
 
         self._B_inference = None
 
         self._Z = None
         self._B = None
 
+    @property
+    def data(self):
+        return self._D_inference.param
+        
     def link_prior(self, Z_inference=None, B_inference=None):
         ## don't need to save Z_inference
         self._B_inference = B_inference if B_inference != None else self._B_inference
@@ -628,8 +489,6 @@ class ZSampler(Sampler):
         logpost_off = logpost_off if logpost_off != -np.inf else -1e20
         
         prob = np.exp(logpost_on - np.logaddexp(logpost_on, logpost_off))
-
-        #print obj, latfeat, logpost_off, logpost_on, prob
         
         return sp.stats.bernoulli.rvs(prob)
 
@@ -782,7 +641,7 @@ class BSampler(Sampler):
 class Optimizer(object):
 
     def __init__(self, data, learning_rate=0.01):
-        self._data = data.get_data().astype(theano.config.floatX)
+        self._data = data.data.astype(theano.config.floatX)
         self._learning_rate = learning_rate
         self._num_of_rows, self._num_of_columns = self._data.shape
     
