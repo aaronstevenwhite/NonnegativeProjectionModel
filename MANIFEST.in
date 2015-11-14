@@ -1,2 +1,2 @@
 include README.md
-include bin/frame_counts.csv
+include bin/fit_model.py
