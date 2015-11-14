@@ -13,21 +13,24 @@ class Data(object):
     observed feature labels in the first row
     '''
     
-    @classmethod
+    @staticmethod
     def _default_obj_filter(obj):
         '''Filter predicate by whether it contains a copula or not'''
         
         return not re.match('^(be|become|are)\s', obj)
     
-    def _load_data(self, fname, obj_filter=Data._default_obj_filter):
+    def _load_data(self, fname, obj_filter):
         '''
         Load data from CSV containing count data; extract object labels 
         from first column and observed feature labels from first row
 
         fname (str): path to data
-        obj_filter (str -> bool): object filtering function
+        obj_filter (str -> bool or NoneType): object filtering function
         '''
 
+        if obj_filter is None:
+            obj_filter = self.__class__._default_obj_filter
+        
         ## load data from file
         data = np.loadtxt(fname, 
                           dtype=str, 
@@ -40,10 +43,10 @@ class Data(object):
 
         ## vectorize the object filter function
         obj_filter_vectorized = np.vectorize(obj_filter)
-
+        
         ## filter objects using the vectorized object filter
         objects_filtered = obj_filter_vectorized(objects)
-
+        
         ## filter observed features by whether they non-zero counts
         obsfeats_filtered = X.sum(axis=0) > 0
 
@@ -64,7 +67,12 @@ class Data(object):
     def data(self):
         '''Get count data'''
         return self._data
-    
+
+    @property
+    def shape(self):
+        '''Get count data shape'''
+        return self._data.shape
+            
     @property
     def num_of_objects(self):
         return self.objects.shape[0]
@@ -80,7 +88,7 @@ class BatchData(Data):
     IO function _load_data is inherited from class Data
     '''
     
-    def __init__(self, fname, obj_filter=Data._default_obj_filter):
+    def __init__(self, fname, obj_filter=None):
         '''
         Load data from CSV containing count data, extracting object labels 
         from first column and observed feature labels from first row
@@ -109,7 +117,7 @@ class IncrementalData(Data):
     without replacement; IO function _load_data is inherited from class Data
     '''
     
-    def __init__(self, fname, obj_filter=Data._default_obj_filter):
+    def __init__(self, fname, obj_filter=None):
         '''
         Load data from CSV containing count data, extracting object labels 
         from first column and observed feature labels from first row
@@ -118,55 +126,35 @@ class IncrementalData(Data):
         obj_filter (str -> bool): object filtering function
         '''
 
-        self._load_data(fname)
+        self._load_data(fname, obj_filter)
 
-        self._initialize_obj_counts()
+        self._initialize_sample_sequence()
         
     def __iter__(self):
         return self
 
-    def _initialize_obj_counts(self):
+    def _initialize_sample_sequence(self):
         '''
-        Initialize variables for total number of times object seen, 
-        number of times object-observed feature pair seen, and number 
-        of times object-observed feature pair could be seen in the future
+        Initialize probability of seeing each object-observed feature pair
+        and construct sample sequence
         '''
 
-        self._data_obj_count = np.zeros(self._data.shape[0])
-        self._unseen = self._data.astype(float)
-        self._seen = np.zeros(self._data.shape)
+        joint_prob = (self._data.astype(float) / self._data.sum()).ravel()
 
-        self._update_joint_prob()
+        print joint_prob
         
-    def _update_joint_prob(self):
-        '''Update probability of seeing each object-observed feature pair'''        
-        
-        joint_prob = self._unseen / self._unseen.sum()
-        self._joint_prob = joint_prob.flatten()
-        
-    def _sample_index(self):
-        '''Sample a single object-observed feature pair'''        
-        
-        pair_index = np.random.choice(a=self._joint_prob.shape[0], 
-                                      p=self._joint_prob)
+        pair_indices = np.random.choice(a=joint_prob.shape[0],
+                                        size=self._data.sum()*100,
+                                        p=joint_prob)
 
-        obj_index = pair_index / self._data.shape[1]
-        obsfeat_index = pair_index / self._data.shape[0]
+        pair_indices = np.column_stack(np.unravel_index(pair_indices,
+                                                        dims=self._data.shape))
         
-        self._unseen[obj_index, obsfeat_index] -= 1
-        self._seen[obj_index, obsfeat_index] += 1
-
-        self._update_joint_prob()
-
-        return obj_index, obsfeat_index
-
+        self._sample_gen = ([i, j] for i, j in pair_indices)
+                
     def next(self):
-        try:
-            assert self._unseen.sum() > 0
-        except AssertionError:
-            raise StopIteration
-
+        sample_ind = self._sample_gen.next()
         datum = np.zeros(self._data.shape)
-        datum[self._sample_index()] += 1
+        datum[sample_ind[0], sample_ind[1]] += 1
 
         return datum

@@ -19,11 +19,18 @@ parser.add_argument('--output',
 
 ## model form
 parser.add_argument('--nonparametric',
-                    type=bool, 
+                    type=bool,
+                    nargs='?',
+                    const=True, 
+                    default=False)
+parser.add_argument('--incremental',
+                    type=bool,
+                    nargs='?',
+                    const=True, 
                     default=False)
 parser.add_argument('--featurenum',
                     type=int, 
-                    default=10)
+                    default=2)
 parser.add_argument('--featureform',
                     type=str, 
                     choices=['discrete', 'continuous'], 
@@ -75,7 +82,7 @@ parser.add_argument('--sampledistributions',
 ## sampler parameters
 parser.add_argument('--iterations', 
                     type=int, 
-                    default=110)
+                    default=1100)
 parser.add_argument('--burnin', 
                     type=int, 
                     default=10)
@@ -86,18 +93,18 @@ parser.add_argument('--thinning',
 ## metropolis-hastings proposer parameters
 parser.add_argument('--distributionproposalbandwidth', 
                     type=float, 
-                    default=1.)
+                    default=.01)
 parser.add_argument('--featloadingsproposalbandwidth', 
                     type=float, 
-                    default=1.)
+                    default=.0000001)
 
 ## optimizer parameters
-parser.add_argument('--maxiter', 
+parser.add_argument('--blockiter', 
                     type=int, 
-                    default=100)
+                    default=1)
 parser.add_argument('--subiter', 
                     type=int, 
-                    default=100)
+                    default=1)
 
 
 ## parse arguments
@@ -126,13 +133,17 @@ except AssertionError:
 ## fitting
 ##########
 
-data = BatchData(data_fname=args.data)
+if args.incremental:
+    data = IncrementalData(fname=args.data)
+else:
+    data = BatchData(fname=args.data)
+
 
 model = Model(data=data, num_of_latfeats=args.featurenum, nonparametric=args.nonparametric,
               alpha=args.alpha, beta=args.beta, gamma=args.gamma, lmbda=args.lmbda,
               sample_D=args.sampledistributions, sample_B=args.samplefeatureloadings,
-              distributionproposalbandwidth=args.distributionproposalbandwidth,
-              featloadingsproposalbandwidth=args.featloadingsproposalbandwidth,
-              maxiter=args.maxiter, subiter=args.subiter)
+              proposalbandwidth_D=args.distributionproposalbandwidth,
+              proposalbandwidth_B=args.featloadingsproposalbandwidth,
+              blockiter=args.blockiter, subiter=args.subiter)
 
 model.fit(iterations=args.iterations, burnin=args.burnin, thinning=args.thinning)
